@@ -1,0 +1,11 @@
+# Rust build output
+target/
+
+# Local-only sibling-checkout overrides
+.cargo/
+
+# rustfmt backups
+**/*.rs.bk
+
+# OS metadata
+.DS_Store
