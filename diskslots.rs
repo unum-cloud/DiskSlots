@@ -111,10 +111,7 @@ impl fmt::Display for Error {
             Error::Refused(refusal) => refusal.fmt(formatter),
             Error::Mismatch { address, part } => {
                 let part = u32::from(*part) + 1;
-                write!(
-                    formatter,
-                    "{address} differs from its source in part {part}"
-                )
+                write!(formatter, "{address} differs from its source in part {part}")
             }
             Error::Stopped { address } => {
                 write!(formatter, "{address}: stopped after the group in flight")
@@ -161,12 +158,12 @@ impl fmt::Display for Refusal {
                 "{object} stores no SHA-256 per part, so nothing proves a download of it"
             ),
             Refusal::UnevenParts { object } => {
-                write!(formatter, "{object} has parts the destination cannot write in whole blocks")
+                write!(
+                    formatter,
+                    "{object} has parts the destination cannot write in whole blocks"
+                )
             }
-            Refusal::Unsupported {
-                source,
-                destination,
-            } => write!(
+            Refusal::Unsupported { source, destination } => write!(
                 formatter,
                 "{source} → {destination}: S3 to S3 goes through a local place, which holds the parts"
             ),
@@ -181,12 +178,7 @@ pub fn print_progress(progress: &copy::Progress) -> ControlFlow<()> {
 }
 
 #[derive(Parser)]
-#[command(
-    name = "diskslots",
-    version,
-    about,
-    args_conflicts_with_subcommands = true
-)]
+#[command(name = "diskslots", version, about, args_conflicts_with_subcommands = true)]
 struct Arguments {
     /// Places to show beside ~/Data and the raw NVMe namespaces: folders, files, drives or s3:// prefixes.
     #[arg(value_parser = parse_address)]
@@ -231,10 +223,7 @@ fn main() -> ExitCode {
         None if interactive => browse::browse(&arguments.places, endpoint),
         None => list::list(&arguments.places, endpoint),
         Some(Verb::List { places }) => list::list(places, endpoint),
-        Some(Verb::Copy {
-            source,
-            destination,
-        }) => copy::copy(source, destination, endpoint),
+        Some(Verb::Copy { source, destination }) => copy::copy(source, destination, endpoint),
         Some(Verb::Free { run }) => free::free(run),
         Some(Verb::Regroup { drive }) => regroup::regroup(drive),
     };

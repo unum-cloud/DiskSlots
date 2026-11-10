@@ -38,9 +38,7 @@ impl FreePlan {
     /// `/dev/nvme0n1@96GiB`.
     pub fn new(run: &Address) -> Result<FreePlan, Error> {
         let Location::Path(drive) = &run.location else {
-            return Err(Error::Refused(Refusal::NotDrive {
-                address: run.clone(),
-            }));
+            return Err(Error::Refused(Refusal::NotDrive { address: run.clone() }));
         };
         let first = slot_at(run)?;
         refuse_held(drive, run)?;
@@ -139,13 +137,7 @@ mod tests {
         assert!(matches!(map.spans[0].owner, SpanOwner::Foreign));
 
         let refusal = |slot| FreePlan::new(&address(slot)).err();
-        assert!(matches!(
-            refusal(0),
-            Some(Error::Refused(Refusal::Free { .. }))
-        ));
-        assert!(matches!(
-            refusal(1),
-            Some(Error::Refused(Refusal::Foreign { .. }))
-        ));
+        assert!(matches!(refusal(0), Some(Error::Refused(Refusal::Free { .. }))));
+        assert!(matches!(refusal(1), Some(Error::Refused(Refusal::Foreign { .. }))));
     }
 }

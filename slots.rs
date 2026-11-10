@@ -114,10 +114,7 @@ pub enum Slot {
 pub fn classify(prefix: &[u8], room: u64) -> Slot {
     if prefix.starts_with(&safegraphs::MAGIC) {
         return match GraphHeader::read_in(prefix, Global) {
-            Ok(header)
-                if header.file_bytes() as u64 <= room
-                    && header.segment_start as u64 <= SLOT_BYTES =>
-            {
+            Ok(header) if header.file_bytes() as u64 <= room && header.segment_start as u64 <= SLOT_BYTES => {
                 Slot::SafeGraphs(Graph {
                     header_digest: sz::Sha256::hash(&prefix[..header.segment_start]),
                     file_bytes: header.file_bytes() as u64,
@@ -201,10 +198,7 @@ impl SlotMap {
     }
 
     pub fn occupied(&self) -> Vec<Range<u32>> {
-        self.spans
-            .iter()
-            .map(|span| span.first_slot..span.end())
-            .collect()
+        self.spans.iter().map(|span| span.first_slot..span.end()).collect()
     }
 }
 
@@ -228,9 +222,7 @@ pub fn map(device: &Device) -> Result<SlotMap, Error> {
                 });
             }
             Slot::Foreign => match spans.last_mut() {
-                Some(last) if matches!(last.owner, SpanOwner::Foreign) && last.end() == slot => {
-                    last.slots += 1
-                }
+                Some(last) if matches!(last.owner, SpanOwner::Foreign) && last.end() == slot => last.slots += 1,
                 _ => spans.push(Span {
                     first_slot: slot,
                     slots: 1,
@@ -304,12 +296,7 @@ pub mod tests {
         block_with(&prefix)
     }
 
-    pub fn owner_block(
-        version: u32,
-        medium: u32,
-        manifest_offset: u64,
-        manifest_bytes: u64,
-    ) -> Vec<u8> {
+    pub fn owner_block(version: u32, medium: u32, manifest_offset: u64, manifest_bytes: u64) -> Vec<u8> {
         let mut block = OWNER_MAGIC.to_vec();
         block.extend_from_slice(&version.to_le_bytes());
         block.extend_from_slice(&medium.to_le_bytes());
@@ -341,18 +328,12 @@ pub mod tests {
         };
         assert!(graph.file_bytes > 16_000 && graph.file_bytes < BLOCK as u64 + 16_000);
         // A header claiming more than the drive holds past its slot is not trusted.
-        assert!(matches!(
-            classify(&graph_prefix(4 * SLOT_BYTES), room),
-            Slot::Foreign
-        ));
+        assert!(matches!(classify(&graph_prefix(4 * SLOT_BYTES), room), Slot::Foreign));
         assert!(matches!(
             classify(&owner_block(1, 0, 0, 0), SLOT_BYTES),
             Slot::UStore(block) if block.database == DATABASE
         ));
-        assert!(matches!(
-            classify(&owner_block(2, 0, 0, 0), SLOT_BYTES),
-            Slot::Foreign
-        ));
+        assert!(matches!(classify(&owner_block(2, 0, 0, 0), SLOT_BYTES), Slot::Foreign));
         assert!(matches!(classify(&block_with(&[]), SLOT_BYTES), Slot::Free));
         // One stray byte anywhere in the first block makes the slot foreign, never free.
         let mut stray = block_with(&[]);

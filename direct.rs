@@ -52,10 +52,7 @@ impl Device {
             address: Address::path(path),
             source,
         };
-        let drive = std::fs::metadata(path)
-            .map_err(failed)?
-            .file_type()
-            .is_block_device();
+        let drive = std::fs::metadata(path).map_err(failed)?.file_type().is_block_device();
         let mut options = OpenOptions::new();
         options.read(true).write(access == Access::Write);
         let exclusive = drive && access == Access::Write;
@@ -97,27 +94,24 @@ impl Device {
         Address::extent(&self.path, extent)
     }
 
+    /// The error of a call on `extent`, the whole device when it is empty.
     fn failed(&self, extent: Range<u64>) -> impl FnOnce(io::Error) -> Error + '_ {
-        move |source| Error::Io {
-            address: self.address(extent),
-            source,
-        }
+        let address = match extent.is_empty() {
+            true => Address::path(&self.path),
+            false => self.address(extent),
+        };
+        move |source| Error::Io { address, source }
     }
 
     /// Reads into `buffer` from `offset` until it is full or the file ends, returning the bytes read.
     pub fn read_at(&self, buffer: &mut [u8], offset: u64) -> Result<usize, Error> {
         let mut filled = 0;
         while filled < buffer.len() {
-            match self
-                .file
-                .read_at(&mut buffer[filled..], offset + filled as u64)
-            {
+            match self.file.read_at(&mut buffer[filled..], offset + filled as u64) {
                 Ok(0) => break,
                 Ok(read) => filled += read,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(source) => {
-                    return Err(self.failed(offset..offset + buffer.len() as u64)(source))
-                }
+                Err(source) => return Err(self.failed(offset..offset + buffer.len() as u64)(source)),
             }
         }
         Ok(filled)
@@ -125,12 +119,19 @@ impl Device {
 
     pub fn write_at(&self, buffer: &[u8], offset: u64) -> Result<(), Error> {
         let extent = offset..offset + buffer.len() as u64;
-        self.file
-            .write_all_at(buffer, offset)
-            .map_err(self.failed(extent))
+        self.file.write_all_at(buffer, offset).map_err(self.failed(extent))
     }
 
     pub fn sync(&self) -> Result<(), Error> {
+        // macOS takes no `F_FULLFSYNC` on a disk node, and flushes its cache by ioctl instead.
+        #[cfg(target_os = "macos")]
+        if self.drive {
+            // SAFETY: `DKIOCSYNCHRONIZECACHE` takes no argument.
+            return match unsafe { libc::ioctl(self.file.as_raw_fd(), DKIOCSYNCHRONIZECACHE) } {
+                0 => Ok(()),
+                _ => Err(self.failed(0..0)(io::Error::last_os_error())),
+            };
+        }
         self.file.sync_all().map_err(self.failed(0..0))
     }
 
@@ -173,9 +174,7 @@ fn open_direct(options: &OpenOptions, path: &Path, exclusive: bool) -> io::Resul
     match direct.open(path) {
         Ok(file) => Ok((file, true)),
         // tmpfs and some network filesystems refuse `O_DIRECT`; the buffered path moves the same bytes.
-        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
-            Ok((options.open(path)?, false))
-        }
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => Ok((options.open(path)?, false)),
         Err(error) => Err(error),
     }
 }
@@ -186,10 +185,7 @@ fn open_direct(options: &OpenOptions, path: &Path, _exclusive: bool) -> io::Resu
 }
 
 fn nonzero(value: u64, query: &'static str) -> Result<NonZeroU32, &'static str> {
-    u32::try_from(value)
-        .ok()
-        .and_then(NonZeroU32::new)
-        .ok_or(query)
+    u32::try_from(value).ok().and_then(NonZeroU32::new).ok_or(query)
 }
 
 /// A logical block, which every direct transfer aligns to and so must be a power of two.
@@ -226,10 +222,7 @@ fn drive_geometry(mut file: &File, path: &Path) -> Result<Geometry, &'static str
         .ok_or(MAX_SECTORS)?;
     Ok(Geometry {
         bytes: file.seek(SeekFrom::End(0)).map_err(|_| "SEEK_END")?,
-        logical_block: block(
-            u64::try_from(logical_block).map_err(|_| "BLKSSZGET")?,
-            "BLKSSZGET",
-        )?,
+        logical_block: block(u64::try_from(logical_block).map_err(|_| "BLKSSZGET")?, "BLKSSZGET")?,
         transfer_bytes: nonzero(transfer_kib.saturating_mul(MAX_SECTORS_UNIT), MAX_SECTORS)?,
     })
 }
@@ -256,10 +249,7 @@ fn file_geometry(file: &File, direct: bool) -> Result<Geometry, &'static str> {
         false => block(status.stx_blksize.into(), "stx_blksize")?,
         true if status.stx_mask & libc::STATX_DIOALIGN == 0 => return Err("STATX_DIOALIGN"),
         true => block(
-            status
-                .stx_dio_offset_align
-                .max(status.stx_dio_mem_align)
-                .into(),
+            status.stx_dio_offset_align.max(status.stx_dio_mem_align).into(),
             "STATX_DIOALIGN",
         )?,
     };
@@ -278,17 +268,17 @@ const DKIOCGETBLOCKSIZE: libc::c_ulong = 0x4004_6418;
 #[cfg(target_os = "macos")]
 const DKIOCGETBLOCKCOUNT: libc::c_ulong = 0x4008_6419;
 
+/// `_IO('d', 22)` in `<sys/disk.h>`.
+#[cfg(target_os = "macos")]
+const DKIOCSYNCHRONIZECACHE: libc::c_ulong = 0x2000_6416;
+
 /// `_IOR('d', 70, uint64_t)` in `<sys/disk.h>`.
 #[cfg(target_os = "macos")]
 const DKIOCGETMAXBYTECOUNTREAD: libc::c_ulong = 0x4008_6446;
 
 /// The value a `<sys/disk.h>` ioctl writes, or `query` when the device refuses it.
 #[cfg(target_os = "macos")]
-fn disk_query<Value: Default>(
-    file: &File,
-    request: libc::c_ulong,
-    query: &'static str,
-) -> Result<Value, &'static str> {
+fn disk_query<Value: Default>(file: &File, request: libc::c_ulong, query: &'static str) -> Result<Value, &'static str> {
     let mut value = Value::default();
     // SAFETY: each request this module sends writes one `Value` it names, which outlives the call.
     match unsafe { libc::ioctl(file.as_raw_fd(), request, &mut value as *mut Value) } {
@@ -303,9 +293,7 @@ fn drive_geometry(file: &File, _path: &Path) -> Result<Geometry, &'static str> {
     let blocks: u64 = disk_query(file, DKIOCGETBLOCKCOUNT, "DKIOCGETBLOCKCOUNT")?;
     let transfer: u64 = disk_query(file, DKIOCGETMAXBYTECOUNTREAD, "DKIOCGETMAXBYTECOUNTREAD")?;
     Ok(Geometry {
-        bytes: blocks
-            .checked_mul(logical_block.into())
-            .ok_or("DKIOCGETBLOCKCOUNT")?,
+        bytes: blocks.checked_mul(logical_block.into()).ok_or("DKIOCGETBLOCKCOUNT")?,
         logical_block: block(logical_block.into(), "DKIOCGETBLOCKSIZE")?,
         transfer_bytes: nonzero(transfer, "DKIOCGETMAXBYTECOUNTREAD")?,
     })
@@ -352,8 +340,8 @@ pub fn filesystem_bytes(path: &Path) -> Result<u64, Error> {
         address: Address::path(path),
         source,
     };
-    let text = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| failed(io::ErrorKind::InvalidInput.into()))?;
+    let text =
+        std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| failed(io::ErrorKind::InvalidInput.into()))?;
     // SAFETY: `statvfs` is plain data the call fills.
     let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: `text` is NUL-terminated and `stats` outlives the call.
@@ -387,16 +375,10 @@ impl AlignedBuffer {
         let length = usize::try_from(bytes).map_err(|_| out_of_memory())?;
         let reserved = length.checked_add(alignment).ok_or_else(out_of_memory)?;
         let mut storage = Vec::new();
-        storage
-            .try_reserve_exact(reserved)
-            .map_err(|_| out_of_memory())?;
+        storage.try_reserve_exact(reserved).map_err(|_| out_of_memory())?;
         storage.resize(reserved, 0);
         let start = storage.as_ptr().align_offset(alignment);
-        Ok(AlignedBuffer {
-            storage,
-            start,
-            length,
-        })
+        Ok(AlignedBuffer { storage, start, length })
     }
 }
 
@@ -429,11 +411,7 @@ pub struct PooledBuffer {
 
 impl BufferPool {
     /// Allocates `buffers` zeroed buffers of `buffer_bytes` each for `device`'s transfers.
-    pub fn new(
-        device: &Device,
-        buffers: NonZeroU16,
-        buffer_bytes: u64,
-    ) -> Result<BufferPool, Error> {
+    pub fn new(device: &Device, buffers: NonZeroU16, buffer_bytes: u64) -> Result<BufferPool, Error> {
         let (returning, returned) = mpsc::sync_channel(buffers.get().into());
         for _ in 0..buffers.get() {
             returning
@@ -504,18 +482,10 @@ mod tests {
         assert_eq!(part_bytes(0, &device), smallest);
         assert_eq!(part_bytes(parts_max * smallest, &device), smallest);
         assert_eq!(part_bytes(parts_max * smallest + 1, &device), smallest * 2);
-        for bytes in [
-            1,
-            S3_PART_BYTES_MIN,
-            parts_max * S3_PART_BYTES_MIN + 1,
-            u64::MAX,
-        ] {
+        for bytes in [1, S3_PART_BYTES_MIN, parts_max * S3_PART_BYTES_MIN + 1, u64::MAX] {
             let part = part_bytes(bytes, &device);
             assert!(part >= S3_PART_BYTES_MIN && part >= transfer && part.is_power_of_two());
-            assert!(
-                bytes.div_ceil(part) <= parts_max,
-                "{bytes} bytes in parts of {part}"
-            );
+            assert!(bytes.div_ceil(part) <= parts_max, "{bytes} bytes in parts of {part}");
         }
     }
 
@@ -535,9 +505,7 @@ mod tests {
         assert_eq!(first.as_ref().len(), 100);
         let body = bytes::Bytes::from_owner(first);
         assert_eq!(body.len(), 100);
-        std::thread::spawn(move || drop((body, second)))
-            .join()
-            .unwrap();
+        std::thread::spawn(move || drop((body, second))).join().unwrap();
 
         let again = [pool.take(), pool.take()];
         assert!(again.iter().all(|buffer| buffer.as_ref().len() == 1 << 16));

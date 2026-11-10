@@ -17,9 +17,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{
-    ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, CompletedPart, StorageClass,
-};
+use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, CompletedPart, StorageClass};
 use bytes::Bytes;
 use forkunion as fu;
 use futures_util::future::try_join_all;
@@ -86,8 +84,8 @@ pub struct Transfer {
 impl Transfer {
     /// An empty source still takes one empty part, as S3 completes no upload without one.
     fn new(source: Endpoint, destination: Endpoint, bytes: u64, part_bytes: u64) -> Transfer {
-        let parts = u16::try_from(bytes.div_ceil(part_bytes))
-            .expect("part_bytes keeps a transfer within S3_PARTS_MAX parts");
+        let parts =
+            u16::try_from(bytes.div_ceil(part_bytes)).expect("part_bytes keeps a transfer within S3_PARTS_MAX parts");
         Transfer {
             source,
             destination,
@@ -135,11 +133,7 @@ impl fmt::Display for Progress {
         write!(formatter, "{done} of {total}")?;
         let seconds = self.started.elapsed().as_secs_f64();
         match seconds > 0.0 {
-            true => write!(
-                formatter,
-                ", {}/s",
-                size((self.bytes_done as f64 / seconds) as u64)
-            ),
+            true => write!(formatter, ", {}/s", size((self.bytes_done as f64 / seconds) as u64)),
             false => Ok(()),
         }
     }
@@ -163,10 +157,7 @@ impl fmt::Display for CopyPlan {
             .map(|transfer| u64::from(transfer.parts.get()))
             .sum();
         let (source, destination, bytes) = (&self.source, &self.destination, size(self.bytes));
-        write!(
-            formatter,
-            "copy {source} → {destination}: {bytes} in {parts} parts"
-        )
+        write!(formatter, "copy {source} → {destination}: {bytes} in {parts} parts")
     }
 }
 
@@ -197,14 +188,8 @@ struct Sources {
 
 impl CopyPlan {
     /// Resolves both addresses and checks every rule before any byte moves.
-    pub fn new(
-        source: &Address,
-        destination: &Address,
-        s3: Option<&S3>,
-    ) -> Result<CopyPlan, Error> {
-        if let (Location::Bucket(from), Location::Bucket(to)) =
-            (&source.location, &destination.location)
-        {
+    pub fn new(source: &Address, destination: &Address, s3: Option<&S3>) -> Result<CopyPlan, Error> {
+        if let (Location::Bucket(from), Location::Bucket(to)) = (&source.location, &destination.location) {
             return Err(Error::Refused(Refusal::Unsupported {
                 source: from.clone(),
                 destination: to.clone(),
@@ -225,16 +210,9 @@ impl CopyPlan {
 
     /// Moves every transfer, calling `report` after every group of parts and stopping after the
     /// group in flight once it breaks.
-    pub fn run(
-        &self,
-        s3: Option<&S3>,
-        mut report: impl FnMut(&Progress) -> ControlFlow<()>,
-    ) -> Result<(), Error> {
+    pub fn run(&self, s3: Option<&S3>, mut report: impl FnMut(&Progress) -> ControlFlow<()>) -> Result<(), Error> {
         let mut progress = Progress::new(self.bytes);
-        let (first, rest) = self
-            .transfers
-            .split_first()
-            .expect("a plan holds a transfer");
+        let (first, rest) = self.transfers.split_first().expect("a plan holds a transfer");
         let sides = Sides::open(first, s3)?;
         let mut engine = Engine::new(&self.transfers, sides.aligned())?;
         engine.transfer(first, sides, &mut progress, &mut report)?;
@@ -252,10 +230,7 @@ pub fn copy(source: &Address, destination: &Address, endpoint: Option<&str>) -> 
     let plan = CopyPlan::new(source, destination, s3.as_ref())?;
     println!("{plan}");
     plan.run(s3.as_ref(), crate::print_progress)?;
-    println!(
-        "{} holds a checked copy of {}",
-        plan.destination, plan.source
-    );
+    println!("{} holds a checked copy of {}", plan.destination, plan.source);
     Ok(())
 }
 
@@ -333,9 +308,7 @@ fn drive_source(path: &Path, address: &Address) -> Result<Sources, Error> {
         Some(span) => match &span.owner {
             SpanOwner::SafeGraphs(graph) => graph.file_bytes,
             SpanOwner::UStore { .. } => u64::from(span.slots) << SLOT_SHIFT,
-            SpanOwner::Foreign => {
-                return Err(refused(|address| Refusal::Foreign { address }, address))
-            }
+            SpanOwner::Foreign => return Err(refused(|address| Refusal::Foreign { address }, address)),
         },
         None => return Err(refused(|address| Refusal::Empty { address }, address)),
     };
@@ -370,10 +343,7 @@ fn bucket_sources(s3: &S3, prefix: &ObjectAddress) -> Result<Sources, Error> {
         items.push(object_item(s3, object, entry.name)?);
     }
     if items.is_empty() {
-        return Err(refused(
-            |address| Refusal::Empty { address },
-            &Address::whole(location),
-        ));
+        return Err(refused(|address| Refusal::Empty { address }, &Address::whole(location)));
     }
     Ok(Sources {
         name: location.name(),
@@ -382,20 +352,10 @@ fn bucket_sources(s3: &S3, prefix: &ObjectAddress) -> Result<Sources, Error> {
 }
 
 fn object_exists(s3: &S3, object: &ObjectAddress) -> Result<bool, Error> {
-    let head = s3
-        .client
-        .head_object()
-        .bucket(&object.bucket)
-        .key(&object.key);
+    let head = s3.client.head_object().bucket(&object.bucket).key(&object.key);
     match s3.block_on(head.send()) {
         Ok(_) => Ok(true),
-        Err(error)
-            if error
-                .as_service_error()
-                .is_some_and(|error| error.is_not_found()) =>
-        {
-            Ok(false)
-        }
+        Err(error) if error.as_service_error().is_some_and(|error| error.is_not_found()) => Ok(false),
         Err(error) => Err(s3_failed(object)(error)),
     }
 }
@@ -403,11 +363,7 @@ fn object_exists(s3: &S3, object: &ObjectAddress) -> Result<bool, Error> {
 /// An object's length and part size, from its first and last parts, refusing an object whose parts
 /// carry no SHA-256.
 fn object_item(s3: &S3, object: ObjectAddress, relative: String) -> Result<Item, Error> {
-    let uneven = || {
-        Error::Refused(Refusal::UnevenParts {
-            object: object.clone(),
-        })
-    };
+    let uneven = || Error::Refused(Refusal::UnevenParts { object: object.clone() });
     let part_length = |index: u16| -> Result<(u64, NonZeroU16), Error> {
         let head = s3
             .client
@@ -418,13 +374,9 @@ fn object_item(s3: &S3, object: ObjectAddress, relative: String) -> Result<Item,
             .checksum_mode(ChecksumMode::Enabled);
         let output = s3.block_on(head.send()).map_err(s3_failed(&object))?;
         if output.checksum_sha256().is_none() {
-            return Err(Error::Refused(Refusal::Unverifiable {
-                object: object.clone(),
-            }));
+            return Err(Error::Refused(Refusal::Unverifiable { object: object.clone() }));
         }
-        let length = output
-            .content_length()
-            .and_then(|length| u64::try_from(length).ok());
+        let length = output.content_length().and_then(|length| u64::try_from(length).ok());
         // An object uploaded whole reports no part count, and is its own one part.
         let parts = match output.parts_count() {
             Some(count) => u16::try_from(count).ok().and_then(NonZeroU16::new),
@@ -462,8 +414,7 @@ fn payload(item: &Item, destination: &Device, s3: Option<&S3>) -> Result<Payload
     let head: &[u8] = match &item.endpoint {
         Endpoint::File(path) | Endpoint::Drive { path, .. } => {
             let device = Device::open(path, Access::Read)?;
-            let mut buffer =
-                AlignedBuffer::zeroed(&device, block.max(device.logical_block.get().into()))?;
+            let mut buffer = AlignedBuffer::zeroed(&device, block.max(device.logical_block.get().into()))?;
             let filled = device.read_at(&mut buffer, address.base)?;
             local = buffer;
             &local[..filled]
@@ -492,10 +443,7 @@ fn require_free(device: &Device, first: u32, slots: u32, bytes: u64) -> Result<(
     let map = slots::map(device)?;
     let run = device.address(slot_extent(first, slots));
     if first.checked_add(slots).is_none_or(|end| end > map.slots) {
-        return Err(Error::Refused(Refusal::Short {
-            address: run,
-            bytes,
-        }));
+        return Err(Error::Refused(Refusal::Short { address: run, bytes }));
     }
     let overlapping = map
         .spans
@@ -515,8 +463,8 @@ fn onto_drive(
     sources: Sources,
     s3: Option<&S3>,
 ) -> Result<(Address, Vec<Transfer>), Error> {
-    let [item] = <[Item; 1]>::try_from(sources.items)
-        .map_err(|_| refused(|address| Refusal::NotGraph { address }, address))?;
+    let [item] =
+        <[Item; 1]>::try_from(sources.items).map_err(|_| refused(|address| Refusal::NotGraph { address }, address))?;
     let device = Device::open(path, Access::Read)?;
     let short = || {
         Error::Refused(Refusal::Short {
@@ -563,28 +511,19 @@ fn onto_drive(
 
 /// An existing folder, a path ending in `/`, a bare bucket or a prefix ending in `/` takes the copy
 /// by the source's name, a bare bucket under `data/`; any other path or prefix is the copy itself.
-fn into_place(
-    address: &Address,
-    sources: Sources,
-    s3: Option<&S3>,
-) -> Result<(Address, Vec<Transfer>), Error> {
+fn into_place(address: &Address, sources: Sources, s3: Option<&S3>) -> Result<(Address, Vec<Transfer>), Error> {
     if address.base != 0 || address.limit != 0 {
         return Err(refused(|address| Refusal::NotDrive { address }, address));
     }
     let into = match &address.location {
-        Location::Path(path) => {
-            path.is_dir() || path.as_os_str().as_encoded_bytes().ends_with(b"/")
-        }
+        Location::Path(path) => path.is_dir() || path.as_os_str().as_encoded_bytes().ends_with(b"/"),
         Location::Bucket(object) => object.key.is_empty() || object.key.ends_with('/'),
     };
     let root = match &address.location {
-        _ if into && sources.name.is_empty() => {
-            return Err(refused(|address| Refusal::Unnamed { address }, address))
+        _ if into && sources.name.is_empty() => return Err(refused(|address| Refusal::Unnamed { address }, address)),
+        Location::Bucket(object) if object.key.is_empty() => {
+            address.location.join(BUCKET_DATA_FOLDER).join(&sources.name)
         }
-        Location::Bucket(object) if object.key.is_empty() => address
-            .location
-            .join(BUCKET_DATA_FOLDER)
-            .join(&sources.name),
         location if into => location.join(&sources.name),
         location => location.clone(),
     };
@@ -604,21 +543,13 @@ fn into_place(
             Location::Bucket(object) => object_exists(connected(s3, address)?, object)?,
         };
         if exists {
-            return Err(refused(
-                |address| Refusal::Exists { address },
-                &Address::whole(target),
-            ));
+            return Err(refused(|address| Refusal::Exists { address }, &Address::whole(target)));
         }
         let destination = match target {
             Location::Path(path) => Endpoint::File(path),
             Location::Bucket(object) => Endpoint::Object(object),
         };
-        transfers.push(Transfer::new(
-            item.endpoint,
-            destination,
-            item.bytes,
-            item.part_bytes,
-        ));
+        transfers.push(Transfer::new(item.endpoint, destination, item.bytes, item.part_bytes));
     }
     Ok((Address::whole(root), transfers))
 }
@@ -701,8 +632,7 @@ impl<'plan> Sides<'plan> {
                 }));
             }
         }
-        let first_blocks =
-            AlignedBuffer::zeroed(&destination.device, transfer.slots() as u64 * block)?;
+        let first_blocks = AlignedBuffer::zeroed(&destination.device, transfer.slots() as u64 * block)?;
         Ok(Sides::Write {
             source,
             destination,
@@ -736,11 +666,7 @@ struct Upload<'plan> {
 }
 
 impl<'plan> Upload<'plan> {
-    fn create(
-        s3: &'plan S3,
-        object: &'plan ObjectAddress,
-        transfer: &Transfer,
-    ) -> Result<Upload<'plan>, Error> {
+    fn create(s3: &'plan S3, object: &'plan ObjectAddress, transfer: &Transfer) -> Result<Upload<'plan>, Error> {
         let create = s3
             .client
             .create_multipart_upload()
@@ -822,11 +748,7 @@ impl<'plan> Upload<'plan> {
 }
 
 async fn download_part(s3: &S3, object: &ObjectAddress, lane: &mut Lane) -> Result<(), Error> {
-    let uneven = || {
-        Error::Refused(Refusal::UnevenParts {
-            object: object.clone(),
-        })
-    };
+    let uneven = || Error::Refused(Refusal::UnevenParts { object: object.clone() });
     let output = s3
         .client
         .get_object()
@@ -838,9 +760,7 @@ async fn download_part(s3: &S3, object: &ObjectAddress, lane: &mut Lane) -> Resu
         .await
         .map_err(s3_failed(object))?;
     if output.checksum_sha256().is_none() {
-        return Err(Error::Refused(Refusal::Unverifiable {
-            object: object.clone(),
-        }));
+        return Err(Error::Refused(Refusal::Unverifiable { object: object.clone() }));
     }
     let address = Address::whole(Location::Bucket(object.clone()));
     let mut body = output.body;
@@ -887,13 +807,9 @@ fn lane_bytes(lane: &Lane) -> &[u8] {
 /// Reads part `lane.index` of `local` into the lane, the bytes past the part zeroed.
 fn read_part(local: &Local, transfer: &Transfer, lane: &mut Lane) -> Result<(), Error> {
     let part = transfer.part(lane.index);
-    let filled = local
-        .device
-        .read_at(lane.buffer.as_mut(), local.base + part.start)?;
+    let filled = local.device.read_at(lane.buffer.as_mut(), local.base + part.start)?;
     if filled < lane.length {
-        let address = local
-            .device
-            .address(local.base + part.start..local.base + part.end);
+        let address = local.device.address(local.base + part.start..local.base + part.end);
         return Err(io_failed(&address)(io::ErrorKind::UnexpectedEof.into()));
     }
     lane.buffer.as_mut()[lane.length..].fill(0);
@@ -928,11 +844,7 @@ fn numa_node(path: &Path) -> Option<fu::MemoryDomainId> {
     let name = fs::canonicalize(path).ok()?.file_name()?.to_owned();
     let folder = fs::canonicalize(Path::new(SYSFS_BLOCK).join(name)).ok()?;
     folder.ancestors().find_map(|folder| {
-        let node: u16 = fs::read_to_string(folder.join(NUMA_NODE))
-            .ok()?
-            .trim()
-            .parse()
-            .ok()?;
+        let node: u16 = fs::read_to_string(folder.join(NUMA_NODE)).ok()?.trim().parse().ok()?;
         Some(fu::MemoryDomainId(i32::from(node)))
     })
 }
@@ -974,7 +886,7 @@ impl Engine {
     /// Sizes the pool for the longest part and the most parts of any transfer: at most one part
     /// per thread, and no more parts than the memory budget holds.
     fn new(transfers: &[Transfer], device: &Device) -> Result<Engine, Error> {
-        let address = device.address(0..0);
+        let address = Address::path(&device.path);
         let failed = |error: fu::Error| io_failed(&address)(io::Error::other(error));
         let topology = fu::Topology::new().map_err(failed)?;
         let threads = spawn_threads(&topology, device).map_err(failed)?;
@@ -1095,14 +1007,9 @@ impl Engine {
         first_blocks: &mut [u8],
     ) -> Result<(), Error> {
         match source {
-            Source::Local(source) => {
-                self.dispatch(transfer, |lane| read_part(source, transfer, lane))?
-            }
+            Source::Local(source) => self.dispatch(transfer, |lane| read_part(source, transfer, lane))?,
             Source::Object { s3, object } => {
-                let downloads = self
-                    .lanes
-                    .iter_mut()
-                    .map(|lane| download_part(s3, object, lane));
+                let downloads = self.lanes.iter_mut().map(|lane| download_part(s3, object, lane));
                 s3.block_on(try_join_all(downloads))?;
             }
         }
@@ -1163,9 +1070,7 @@ impl Engine {
                     lane.outcome = task(lane);
                 }
             })
-            .map_err(|error| {
-                io_failed(&transfer.destination.address(transfer.bytes))(io::Error::other(error))
-            })?;
+            .map_err(|error| io_failed(&transfer.destination.address(transfer.bytes))(io::Error::other(error)))?;
         self.lanes
             .iter_mut()
             .find_map(|lane| std::mem::replace(&mut lane.outcome, Ok(())).err())
@@ -1177,20 +1082,13 @@ impl Engine {
         let lanes = self.lanes.len();
         let states = &mut self.states[..lanes];
         states.fill(sz::Sha256::new());
-        sz::sha256_multistate_update_by(states, &self.lanes, lane_bytes)
-            .expect("one state per lane");
-        sz::sha256_multistate_digest(states, &mut self.digests[..lanes])
-            .expect("one digest per lane");
+        sz::sha256_multistate_update_by(states, &self.lanes, lane_bytes).expect("one state per lane");
+        sz::sha256_multistate_digest(states, &mut self.digests[..lanes]).expect("one digest per lane");
     }
 
     /// Writes the held first blocks in slot order, the first slot's last once all else is durable,
     /// reads each back, and trims a file to its length.
-    fn finish(
-        &mut self,
-        transfer: &Transfer,
-        destination: &Local,
-        first_blocks: &[u8],
-    ) -> Result<(), Error> {
+    fn finish(&mut self, transfer: &Transfer, destination: &Local, first_blocks: &[u8]) -> Result<(), Error> {
         let device = &destination.device;
         let block = device.logical_block.get() as usize;
         let held = |slot: usize| &first_blocks[slot * block..][..block];
@@ -1239,18 +1137,10 @@ mod tests {
         let (source, destination) = (folder.join("source.img"), folder.join("destination.img"));
         let file = fs::File::create(&source).unwrap();
         file.set_len(BYTES).unwrap();
-        for (at, mark) in [
-            (0, 0xA5),
-            (SLOT_BYTES, 0x5A),
-            (MARK, 0x33),
-            (BYTES - 100, 0xC3),
-        ] {
+        for (at, mark) in [(0, 0xA5), (SLOT_BYTES, 0x5A), (MARK, 0x33), (BYTES - 100, 0xC3)] {
             file.write_all_at(&[mark; 100], at).unwrap();
         }
-        fs::File::create(&destination)
-            .unwrap()
-            .set_len(3 * SLOT_BYTES)
-            .unwrap();
+        fs::File::create(&destination).unwrap().set_len(3 * SLOT_BYTES).unwrap();
         (source, destination)
     }
 
@@ -1277,20 +1167,14 @@ mod tests {
         let last = shorter.parts.get() - 1;
         assert_eq!(u64::from(shorter.parts.get()), BYTES.div_ceil(PART_BYTES));
         assert_eq!(shorter.part(last), u64::from(last) * PART_BYTES..BYTES);
-        assert_eq!(
-            transfer(4 * PART_BYTES).part(3),
-            3 * PART_BYTES..4 * PART_BYTES
-        );
+        assert_eq!(transfer(4 * PART_BYTES).part(3), 3 * PART_BYTES..4 * PART_BYTES);
     }
 
     #[test]
     fn writes_every_first_block_last() {
         let folder = tempfile::tempdir().unwrap();
         let (source, destination) = stand_ins(folder.path());
-        let block = Device::open(&destination, Access::Read)
-            .unwrap()
-            .logical_block
-            .get() as u64;
+        let block = Device::open(&destination, Access::Read).unwrap().logical_block.get() as u64;
         let transfer = Transfer::new(
             Endpoint::Drive {
                 path: source.clone(),
@@ -1328,8 +1212,7 @@ mod tests {
         for start in (0..BYTES).step_by(chunk as usize) {
             let end = BYTES.min(start + chunk);
             assert!(
-                read(&source, start..end)
-                    == read(&destination, SLOT_BYTES + start..SLOT_BYTES + end),
+                read(&source, start..end) == read(&destination, SLOT_BYTES + start..SLOT_BYTES + end),
                 "bytes {start}..{end} differ"
             );
         }
@@ -1337,10 +1220,7 @@ mod tests {
             &destination,
             SLOT_BYTES + BYTES..SLOT_BYTES + BYTES.next_multiple_of(block),
         );
-        assert!(
-            after.iter().all(|&byte| byte == 0),
-            "the copy ends at its last byte"
-        );
+        assert!(after.iter().all(|&byte| byte == 0), "the copy ends at its last byte");
     }
 
     #[test]
@@ -1358,10 +1238,7 @@ mod tests {
         );
         let stopped = plan.run(None, |_| ControlFlow::Break(()));
         assert!(matches!(stopped, Err(Error::Stopped { .. })));
-        let block = Device::open(&target, Access::Read)
-            .unwrap()
-            .logical_block
-            .get() as u64;
+        let block = Device::open(&target, Access::Read).unwrap().logical_block.get() as u64;
         assert!(
             read(&target, 0..block).iter().all(|&byte| byte == 0),
             "the first block waits"

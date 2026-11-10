@@ -12,6 +12,35 @@ Run `diskslots` in a terminal, naming any buckets or folders beside the default 
 diskslots s3://bigger-ann s3://usearch-wiki
 ```
 
+On a Mac, with a folder named beside `~/Data` and a disk image attached as `/dev/disk6` holding three SafeGraphs files and a foreign slot, `diskslots ~/Backup /dev/disk6` draws this at 120 × 24 with the drive selected:
+
+```text
+3 places · 4.00 GiB in 11 datasets
+┌ 3 places ────────────────────────────────────┐┌ 4 datasets in /dev/disk6 ────────────────────────────────────────────┐
+│  ~/Backup    31.2 KiB of  926 GiB  █·········││› mirror/sift-1k/index-copy.safegraphs  SafeGraphs  27.5 KiB  1.00K ro│
+│› /dev/disk6  4.00 GiB of 32.0 GiB  ██········││  mirror/sift-1k/index-copy.safegraphs  SafeGraphs  27.5 KiB  1.00K ro│
+│  /dev/disk6: unsupported                     ││  slot 7                                foreign     1.00 GiB          │
+│  ~/Data      30.0 KiB of  926 GiB  █·········││  mirror/sift-1k/index-copy.safegraphs  SafeGraphs  27.5 KiB  1.00K ro│
+│                                              ││                                                                      │
+│                                              ││                                                                      │
+│                                              ││                                                                      │
+│                                              ││                                                                      │
+│                                              ││                                                                      │
+│                                              ││                                                                      │
+│                                              ││                                                                      │
+│                                              ││                                                                      │
+│                                              ││                                                                      │
+│                                              ││                                                                      │
+│                                              ││                                                                      │
+│                                              ││                                                                      │
+│                                              ││                                                                      │
+│                                              ││███····██·······▒▒·········██·········································│
+│                                              ││0  1   3 4      7 8        12                                       32│
+└──────────────────────────────────────────────┘└──────────────────────────────────────────────────────────────────────┘
+
+↑↓ select   →← panes   c copy   f free   r regroup   / filter   ? help   q quit
+```
+
 __Places__, on the left, lists `~/Data`, every NVMe namespace with no filesystem, every NVMe controller bound to `vfio-pci`, and whatever you name.
 A drive adds its model, LBA size, wear, temperature, queues, NUMA node and the processes holding it.
 __Datasets__, on the right, lists what the selected place holds: the format, what its header says, the size, and the other places holding a copy.
@@ -38,7 +67,7 @@ diskslots regroup /dev/nvme0n1
 - `free` frees the SafeGraphs file or UStore database starting at a slot.
 - `regroup` packs a drive's SafeGraphs files towards slot 0.
 
-S3 uses the AWS SDK's default credentials, profile and region, so `AWS_PROFILE` and `AWS_REGION` work as they do for the AWS CLI.
+S3 uses the AWS SDK's default credentials, profile and region, so `AWS_PROFILE` and `AWS_REGION` work as they do for the AWS CLI; SSO profiles are left out.
 `--endpoint https://storage.eu-north1.nebius.cloud` points it at an S3-compatible store instead.
 
 ## Addresses
@@ -73,7 +102,7 @@ UStore databases and foreign slots stay where they are, and the files pack aroun
 
 ## Integrity
 
-Every part of a copy is hashed with SHA-256, sixteen parts per batched call.
+Every part of a copy is hashed with SHA-256, a group of parts per batched call.
 A part bound for S3 carries its digest, and S3 refuses a part whose bytes do not match it.
 A part coming from S3 is compared with the digest S3 stores for it before a byte of it is written.
 A part written to a file or drive is read back and hashed again.

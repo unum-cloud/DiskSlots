@@ -52,6 +52,14 @@ const GRAPH_MARK: char = '█';
 const DATABASE_MARK: char = '▓';
 const FOREIGN_MARK: char = '▒';
 const FILES_MARK: char = '░';
+/// The blank between two table columns, and the indent of what a row holds.
+pub const COLUMN_GAP: &str = "  ";
+/// The blank between a count and its unit or noun when they sit in columns of their own.
+const WORD_GAP: &str = " ";
+/// Marks a table cell cut from the left.
+const ELLIPSIS: char = '…';
+/// The width of every place's usage bar.
+const USAGE_BAR_COLUMNS: u16 = 10;
 
 pub use platform::holders;
 
@@ -198,13 +206,10 @@ pub fn survey(addresses: &[Address], endpoint: Option<&str>) -> Result<Survey, E
 pub fn list(places: &[Address], endpoint: Option<&str>) -> Result<(), Error> {
     let survey = survey(places, endpoint)?;
     println!("{}", survey.summary());
-    for place in 0..index(survey.places.len()) {
-        match &survey.media[place as usize] {
-            Medium::Drive(drive) => println!("{}  {}", survey.place_line(place), drive_line(drive)),
-            _ => println!("{}", survey.place_line(place)),
-        }
-        for row in survey.dataset_rows(survey.datasets_of(place)) {
-            println!("  {row}");
+    for (place, lines) in survey.place_rows(usize::MAX).into_iter().enumerate() {
+        println!("{}", lines.join(&format!("\n{COLUMN_GAP}")));
+        for row in survey.dataset_rows(survey.datasets_of(index(place))) {
+            println!("{COLUMN_GAP}{row}");
         }
     }
     Ok(())
@@ -215,12 +220,7 @@ pub fn index(position: usize) -> u32 {
     u32::try_from(position).expect("a survey holds fewer than 2^32 places and datasets")
 }
 
-fn survey_place(
-    place: &Place,
-    position: u32,
-    s3: Option<&S3>,
-    datasets: &mut Vec<Dataset>,
-) -> Result<Medium, Error> {
+fn survey_place(place: &Place, position: u32, s3: Option<&S3>, datasets: &mut Vec<Dataset>) -> Result<Medium, Error> {
     let io_failed = |path: &Path| {
         let address = Address::path(path);
         move |source| Error::Io { address, source }
@@ -344,12 +344,7 @@ pub fn list_objects(s3: &S3, prefix: &ObjectAddress) -> Result<Vec<Entry>, Error
 }
 
 /// The first `bytes` bytes of `entry` under `location`.
-fn read_prefix(
-    location: &Location,
-    s3: Option<&S3>,
-    entry: &Entry,
-    bytes: u64,
-) -> Result<Vec<u8>, Error> {
+fn read_prefix(location: &Location, s3: Option<&S3>, entry: &Entry, bytes: u64) -> Result<Vec<u8>, Error> {
     match location.join(&entry.name) {
         Location::Path(path) => {
             let mut prefix = Vec::new();
@@ -401,8 +396,7 @@ fn declared_root(entry: &Entry) -> Option<(&str, Kind<'_>)> {
         }
         start = end + '/'.len_utf8();
     }
-    name.ends_with(PARQUET_SUFFIX)
-        .then(|| (parent(name), Kind::Parquet))
+    name.ends_with(PARQUET_SUFFIX).then(|| (parent(name), Kind::Parquet))
 }
 
 /// One dataset gathered from entries: a database, a Parquet subset or a top-level file or folder.
@@ -415,13 +409,7 @@ struct Group<'entries> {
 
 /// Turns the files under one place into datasets: each SafeGraphs file is one, each folder with a
 /// UStore manifest or Parquet files is one, and every other file belongs to its top-level entry.
-fn group(
-    entries: &[Entry],
-    location: &Location,
-    s3: Option<&S3>,
-    place: u32,
-    datasets: &mut Vec<Dataset>,
-) {
+fn group(entries: &[Entry], location: &Location, s3: Option<&S3>, place: u32, datasets: &mut Vec<Dataset>) {
     let read = |entry: &Entry, bytes| read_prefix(location, s3, entry, bytes);
     let (graphs, files): (Vec<&Entry>, Vec<&Entry>) = entries
         .iter()
@@ -488,12 +476,11 @@ fn group(
 /// A SafeGraphs file's header, read from its first bytes alone; a header that does not end inside
 /// one slot or does not parse makes the file foreign.
 fn read_graph(read: impl Fn(u64) -> Result<Vec<u8>, Error>) -> Owner {
-    let header = read(GRAPH_LENGTH_PREFIX_BYTES).and_then(|prefix| {
-        match safegraphs::GraphHeader::segment_start_of(&prefix) {
+    let header =
+        read(GRAPH_LENGTH_PREFIX_BYTES).and_then(|prefix| match safegraphs::GraphHeader::segment_start_of(&prefix) {
             Ok(end) if end as u64 <= SLOT_BYTES => read(end as u64),
             _ => Ok(prefix),
-        }
-    });
+        });
     match header.map(|header| slots::classify(&header, u64::MAX)) {
         Ok(Slot::SafeGraphs(graph)) => Owner::SafeGraphs(graph),
         Ok(_) => Owner::Foreign,
@@ -510,17 +497,9 @@ fn read_manifest(text: Result<Vec<u8>, Error>) -> Owner {
     };
     let parsed = jsontape::parse(&text).ok();
     let field = |name| parsed.as_ref().and_then(|manifest| manifest.get(name));
-    let database = field(MANIFEST_ID)
-        .and_then(|id| id.as_str())
-        .and_then(uuid_bytes);
-    match (
-        database,
-        field(MANIFEST_GENERATION).and_then(|value| value.as_u64()),
-    ) {
-        (Some(database), Some(generation)) => Owner::UStore {
-            database,
-            generation,
-        },
+    let database = field(MANIFEST_ID).and_then(|id| id.as_str()).and_then(uuid_bytes);
+    match (database, field(MANIFEST_GENERATION).and_then(|value| value.as_u64())) {
+        (Some(database), Some(generation)) => Owner::UStore { database, generation },
         _ => Owner::Foreign,
     }
 }
@@ -544,19 +523,10 @@ fn survey_drive(path: &Path, place: u32, datasets: &mut Vec<Dataset>) -> Result<
     for span in map.spans {
         let extent = slot_extent(span.first_slot, span.slots);
         let (extent, owner) = match span.owner {
-            SpanOwner::SafeGraphs(graph) => (
-                extent.start..extent.start + graph.file_bytes,
-                Owner::SafeGraphs(graph),
-            ),
+            SpanOwner::SafeGraphs(graph) => (extent.start..extent.start + graph.file_bytes, Owner::SafeGraphs(graph)),
             SpanOwner::UStore { block, .. } if block.manifest_slot() == Some(span.first_slot) => {
                 let (database, generation) = (block.database, block.manifest_generation);
-                (
-                    extent,
-                    Owner::UStore {
-                        database,
-                        generation,
-                    },
-                )
+                (extent, Owner::UStore { database, generation })
             }
             SpanOwner::UStore { block, .. } => {
                 let (database, medium) = (block.database, block.medium);
@@ -598,18 +568,10 @@ fn same_dataset(first: &Dataset, second: &Dataset) -> bool {
         (Owner::SafeGraphs(first), Owner::SafeGraphs(second)) => {
             first.header_digest == second.header_digest && first.file_bytes == second.file_bytes
         }
-        (
-            Owner::UStore {
-                database: first, ..
-            },
-            Owner::UStore {
-                database: second, ..
-            },
-        ) => first == second,
-        (
-            Owner::Parquet { .. } | Owner::Files { .. },
-            Owner::Parquet { .. } | Owner::Files { .. },
-        ) => same_name(&first.name, &second.name),
+        (Owner::UStore { database: first, .. }, Owner::UStore { database: second, .. }) => first == second,
+        (Owner::Parquet { .. } | Owner::Files { .. }, Owner::Parquet { .. } | Owner::Files { .. }) => {
+            same_name(&first.name, &second.name)
+        }
         _ => false,
     }
 }
@@ -662,28 +624,29 @@ impl Owner {
         }
     }
 
-    /// What its header, manifest or files say.
-    fn facts(&self) -> String {
+    /// What its header, manifest or files say, as a count and the words after it.
+    fn facts(&self) -> [String; 2] {
         match self {
             Owner::SafeGraphs(graph) => {
-                let field = |column: &str, field: &str| {
-                    let column = graph.header.header.get(column)?;
-                    column.get(field).and_then(|value| value.as_str())
-                };
-                let mut facts = count(graph.header.key.rows() as u64);
+                let field = |column: &str, field: &str| graph.header.header.get(column)?.get(field)?.as_str();
+                let mut words = String::from("rows");
                 if let Some(dtype) = field("value", "dtype") {
-                    facts += &format!(" × {dtype}");
+                    words += &format!(" × {dtype}");
                 }
                 if let Some(metric) = field("__metadata__", "metric") {
-                    facts += &format!(", {metric}");
+                    words += &format!(", {metric}");
                 }
-                facts
+                [count(graph.header.key.rows() as u64), words]
             }
-            Owner::UStore { generation, .. } => format!("generation {generation}"),
-            Owner::Directory { medium, .. } => format!("data directory {medium}"),
-            Owner::Parquet { files } | Owner::Files { files } => plural(*files, "file"),
-            Owner::Foreign => String::new(),
-            Owner::Unreadable(error) => error.to_string(),
+            Owner::UStore { generation, .. } => [String::new(), format!("generation {generation}")],
+            Owner::Directory { medium, .. } => [String::new(), format!("data directory {medium}")],
+            Owner::Parquet { files } | Owner::Files { files } => {
+                let words = plural(*files, "file");
+                let (count, noun) = words.split_once(' ').expect("a count and its noun");
+                [count.to_owned(), noun.to_owned()]
+            }
+            Owner::Foreign => [String::new(), String::new()],
+            Owner::Unreadable(error) => [String::new(), error.to_string()],
         }
     }
 }
@@ -707,19 +670,20 @@ pub fn plural(count: u64, noun: &str) -> String {
     }
 }
 
-/// " · held by" and the processes holding a device open, or nothing when none does.
+/// "held by" and the processes holding a device open, or nothing when none does.
 fn held_by(holders: &[Holder]) -> String {
-    let mut text = String::new();
-    for (position, holder) in holders.iter().enumerate() {
-        let length = holder
-            .command
-            .iter()
-            .position(|&byte| byte == 0 || byte == b'\n');
-        let command = String::from_utf8_lossy(&holder.command[..length.unwrap_or(COMMAND_BYTES)]);
-        let lead = if position == 0 { " · held by " } else { ", " };
-        text += &format!("{lead}{command} {}", holder.pid);
+    let names: Vec<String> = holders
+        .iter()
+        .map(|holder| {
+            let length = holder.command.iter().position(|&byte| byte == 0 || byte == b'\n');
+            let command = String::from_utf8_lossy(&holder.command[..length.unwrap_or(COMMAND_BYTES)]);
+            format!("{command} {}", holder.pid)
+        })
+        .collect();
+    match names.is_empty() {
+        true => String::new(),
+        false => format!("held by {}", names.join(", ")),
     }
-    text
 }
 
 /// A drive's model, logical block, wear, temperature and holders.
@@ -734,36 +698,119 @@ pub fn drive_line(drive: &Drive) -> String {
         ),
         Err(error) => error.to_string(),
     };
-    health + &held_by(&drive.holders)
+    [health, held_by(&drive.holders)]
+        .join(" · ")
+        .trim_end_matches(" · ")
+        .to_owned()
 }
 
-/// A drive's slots drawn `columns` wide, each column marking what holds the slots it covers.
-pub fn slot_bar(
-    slots: u32,
-    columns: u32,
-    runs: impl Iterator<Item = (Range<u32>, char)> + Clone,
-) -> String {
-    let (slots, columns) = (u64::from(slots), u64::from(columns));
-    (0..columns * u64::from(slots != 0))
+/// How a table column aligns its cells.
+#[derive(Clone, Copy)]
+pub enum Align {
+    Left,
+    Right,
+}
+
+/// Rows laid out as a table: every column as wide as its widest cell, aligned as `columns` says and
+/// after the separator it names, the first column cut from the left with `…` to at most
+/// `first_columns`, empty columns left out and trailing blanks trimmed.
+pub fn table<const COLUMNS: usize>(
+    rows: &[[String; COLUMNS]],
+    columns: [(Align, &str); COLUMNS],
+    first_columns: usize,
+) -> Vec<String> {
+    let mut widths = [0; COLUMNS];
+    for row in rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    widths[0] = widths[0].min(first_columns);
+    let cut = |cell: &str, width: usize| match cell.chars().count().checked_sub(width) {
+        Some(excess) if excess > 0 => {
+            // The ellipsis takes one column of its own.
+            let kept: String = cell.chars().skip(excess + 1).collect();
+            format!("{ELLIPSIS}{kept}")
+        }
+        _ => cell.to_owned(),
+    };
+    let lines = rows.iter().map(|row| {
+        let mut line = String::new();
+        for (column, cell) in row.iter().enumerate().filter(|&(column, _)| widths[column] != 0) {
+            let (width, cell) = (widths[column], cut(cell, widths[column]));
+            let fill = " ".repeat(width - cell.chars().count());
+            let (align, separator) = columns[column];
+            if !line.is_empty() {
+                line += separator;
+            }
+            match align {
+                Align::Left => line += &format!("{cell}{fill}"),
+                Align::Right => line += &format!("{fill}{cell}"),
+            }
+        }
+        line.trim_end().to_owned()
+    });
+    lines.collect()
+}
+
+/// `used` of `bytes` as `USAGE_BAR_COLUMNS` columns, a column filled once any part of it is.
+fn usage_bar(used: u64, bytes: u64) -> String {
+    let columns = u64::from(USAGE_BAR_COLUMNS);
+    let filled = (u128::from(used) * u128::from(columns))
+        .div_ceil(u128::from(bytes.max(1)))
+        .min(columns.into());
+    (0..columns)
         .map(|column| {
-            let first = column * slots / columns;
-            let end = ((column + 1) * slots / columns).max(first + 1);
-            runs.clone()
-                .find(|(run, _)| u64::from(run.start) < end && first < u64::from(run.end))
-                .map_or(FREE_MARK, |(_, mark)| mark)
+            if u128::from(column) < filled {
+                GRAPH_MARK
+            } else {
+                FREE_MARK
+            }
         })
         .collect()
+}
+
+/// A drive's slots drawn `columns` wide, each column marking the first run among the slots it
+/// covers, and the line under it: the first slot of every run and free stretch under the column
+/// where its mark starts, and the drive's slot count ending at the bar's end; a label that would
+/// touch another is dropped.
+pub fn slot_bar(slots: u32, columns: u32, runs: impl Iterator<Item = (Range<u32>, char)> + Clone) -> [String; 2] {
+    let (bar, columns) = (u64::from(slots), u64::from(columns));
+    let shown: Vec<(char, u32)> = (0..columns * u64::from(slots != 0))
+        .map(|column| {
+            let first = column * bar / columns;
+            let end = ((column + 1) * bar / columns).max(first + 1);
+            let overlapping = runs
+                .clone()
+                .find(|(run, _)| u64::from(run.start) < end && first < u64::from(run.end));
+            let free = runs
+                .clone()
+                .map(|(run, _)| run.end)
+                .filter(|&end| u64::from(end) <= first)
+                .max();
+            overlapping.map_or((FREE_MARK, free.unwrap_or(0)), |(run, mark)| (mark, run.start))
+        })
+        .collect();
+    let last = slots.to_string();
+    let end = (columns as usize).saturating_sub(last.len());
+    let mut labels = String::new();
+    for (at, &(_, start)) in shown.iter().enumerate() {
+        let label = start.to_string();
+        let fresh = at == 0 || shown[at - 1].1 != start;
+        if fresh && (labels.is_empty() || at > labels.len()) && at + label.len() < end {
+            labels += &" ".repeat(at - labels.len());
+            labels += &label;
+        }
+    }
+    labels += &" ".repeat(end.saturating_sub(labels.len()).max(usize::from(!labels.is_empty())));
+    [shown.iter().map(|&(mark, _)| mark).collect(), labels + &last]
 }
 
 impl Survey {
     /// The datasets of place `place`.
     pub fn datasets_of(&self, place: u32) -> Range<u32> {
-        let start = self
-            .datasets
-            .partition_point(|dataset| dataset.place < place);
-        let end = self
-            .datasets
-            .partition_point(|dataset| dataset.place <= place);
+        let start = self.datasets.partition_point(|dataset| dataset.place < place);
+        let end = self.datasets.partition_point(|dataset| dataset.place <= place);
         index(start)..index(end)
     }
 
@@ -803,8 +850,8 @@ impl Survey {
         }
     }
 
-    /// The other places holding a copy of `dataset`, each once, in place order.
-    pub fn copies(&self, dataset: u32) -> Vec<u32> {
+    /// "also" and the other places holding a copy of `dataset`, each once, or "only here".
+    pub fn copies_line(&self, dataset: u32) -> String {
         let place = self.dataset(dataset).place;
         let mut places: Vec<u32> = (0..index(self.copy_of.len()))
             .filter(|&other| self.copy_of[other as usize] == self.copy_of[dataset as usize])
@@ -812,13 +859,7 @@ impl Survey {
             .filter(|&other| other != place)
             .collect();
         places.dedup();
-        places
-    }
-
-    /// "also" and the other places holding a copy of `dataset`, or "only here".
-    pub fn copies_line(&self, dataset: u32) -> String {
-        let copies = self.copies(dataset);
-        let names: Vec<String> = copies
+        let names: Vec<String> = places
             .iter()
             .map(|&place| self.places[place as usize].to_string())
             .collect();
@@ -833,24 +874,48 @@ impl Survey {
         let places = index(self.places.len());
         let bytes: u64 = (0..places).map(|place| self.used_bytes(place)).sum();
         let datasets = plural(self.datasets.len() as u64, "dataset");
-        format!(
-            "{} · {} in {datasets}",
-            plural(places.into(), "place"),
-            size(bytes)
-        )
+        format!("{} · {} in {datasets}", plural(places.into(), "place"), size(bytes))
     }
 
-    /// A place and how much it holds of how much it takes.
-    pub fn place_line(&self, place: u32) -> String {
-        let location = &self.places[place as usize];
-        let used = size(self.used_bytes(place));
-        match &self.media[place as usize] {
-            Medium::Filesystem { bytes } => format!("{location}  {used} of {}", size(*bytes)),
-            Medium::Drive(drive) => format!("{location}  {used} of {}", size(drive.bytes)),
-            Medium::Bucket => format!("{location}  {used}"),
-            Medium::Bound { holders } => format!("{location}{}", held_by(holders)),
-            Medium::Unreachable(error) => format!("{location}  {error}"),
-        }
+    /// One row per place: its name cut to `name_columns`, how much it holds of how much it takes
+    /// and a usage bar, or its holders or error; a drive's health is the line under its row.
+    pub fn place_rows(&self, name_columns: usize) -> Vec<Vec<String>> {
+        let cells: Vec<[String; 6]> = (0..index(self.places.len()))
+            .map(|place| {
+                let name = self.places[place as usize].to_string();
+                let used = self.used_bytes(place);
+                let filled = |bytes: u64| [size(used), "of".to_owned(), size(bytes), usage_bar(used, bytes)];
+                let [used, of, bytes, bar] = match &self.media[place as usize] {
+                    Medium::Filesystem { bytes } => filled(*bytes),
+                    Medium::Drive(drive) => filled(drive.bytes),
+                    Medium::Bucket => [size(used), String::new(), String::new(), String::new()],
+                    Medium::Bound { .. } | Medium::Unreachable(_) => Default::default(),
+                };
+                let note = match &self.media[place as usize] {
+                    Medium::Bound { holders } => held_by(holders),
+                    Medium::Unreachable(error) => error.to_string(),
+                    _ => String::new(),
+                };
+                [name, used, of, bytes, bar, note]
+            })
+            .collect();
+        let [left, right] = [(Align::Left, COLUMN_GAP), (Align::Right, COLUMN_GAP)];
+        let columns = [
+            left,
+            right,
+            (Align::Left, WORD_GAP),
+            (Align::Right, WORD_GAP),
+            left,
+            left,
+        ];
+        let rows = table(&cells, columns, name_columns);
+        rows.into_iter()
+            .zip(&self.media)
+            .map(|(row, medium)| match medium {
+                Medium::Drive(drive) => vec![row, drive_line(drive)],
+                _ => vec![row],
+            })
+            .collect()
     }
 
     /// A dataset's name: its own, else a named copy's, else a database's ID, its first slot or its
@@ -859,66 +924,50 @@ impl Survey {
         let found = self.dataset(dataset);
         let class = self.copy_of[dataset as usize];
         let named = std::iter::once(dataset)
-            .chain(
-                (0..index(self.copy_of.len()))
-                    .filter(|&other| self.copy_of[other as usize] == class),
-            )
+            .chain((0..index(self.copy_of.len())).filter(|&other| self.copy_of[other as usize] == class))
             .map(|other| &self.dataset(other).name)
             .find(|name| !name.trim_matches('/').is_empty());
         if let Some(name) = named {
             return name.trim_start_matches('/').to_owned();
         }
         match (&self.places[found.place as usize], &found.owner) {
-            (
-                Place::Drive(_),
-                Owner::UStore { database, .. } | Owner::Directory { database, .. },
-            ) => {
+            (Place::Drive(_), Owner::UStore { database, .. } | Owner::Directory { database, .. }) => {
                 let group = &database[..UUID_FIRST_GROUP_BYTES];
-                group
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-                    + "…"
+                group.iter().map(|byte| format!("{byte:02x}")).collect::<String>() + "…"
             }
             (Place::Drive(_), _) => format!("slot {}", slot_range(&found.extent).start),
-            (Place::Folder(path) | Place::File(path) | Place::Bound(path), _) => {
-                match path.file_name() {
-                    Some(name) => name.to_string_lossy().into_owned(),
-                    None => path.display().to_string(),
-                }
-            }
+            (Place::Folder(path) | Place::File(path) | Place::Bound(path), _) => match path.file_name() {
+                Some(name) => name.to_string_lossy().into_owned(),
+                None => path.display().to_string(),
+            },
             (Place::Bucket(object), _) => Location::Bucket(object.clone()).name(),
         }
     }
 
-    /// One aligned row per dataset: its name, owner, size, facts and the other places holding a
-    /// copy.
+    /// One row per dataset: its name, owner, size, the count and words its header or files give,
+    /// and the other places holding a copy.
     pub fn dataset_rows(&self, datasets: impl Iterator<Item = u32>) -> Vec<String> {
-        let cells: Vec<[String; 5]> = datasets
+        let cells: Vec<[String; 6]> = datasets
             .map(|dataset| {
                 let found = self.dataset(dataset);
+                let [count, words] = found.owner.facts();
+                let (name, owner, bytes) = (self.dataset_name(dataset), found.owner.name(), dataset_bytes(found));
                 [
-                    self.dataset_name(dataset),
-                    found.owner.name().to_owned(),
-                    size(dataset_bytes(found)),
-                    found.owner.facts(),
+                    name,
+                    owner.to_owned(),
+                    size(bytes),
+                    count,
+                    words,
                     self.copies_line(dataset),
                 ]
             })
             .collect();
-        let mut widths = [0; 4];
-        for row in &cells {
-            for (width, cell) in widths.iter_mut().zip(row) {
-                *width = (*width).max(cell.chars().count());
-            }
-        }
-        let [name, owner, size, facts] = widths;
-        cells
-            .iter()
-            .map(|[n, o, s, f, copies]| {
-                format!("{n:<name$}  {o:<owner$}  {s:>size$}  {f:<facts$}  {copies}")
-            })
-            .collect()
+        let [left, right] = [(Align::Left, COLUMN_GAP), (Align::Right, COLUMN_GAP)];
+        table(
+            &cells,
+            [left, left, right, right, (Align::Left, WORD_GAP), left],
+            usize::MAX,
+        )
     }
 }
 
@@ -929,6 +978,7 @@ mod platform {
 
     use super::{Health, Holder};
     use crate::direct::Device;
+    use crate::places::Address;
     use crate::Error;
 
     pub fn holders(_drive: &Path) -> Vec<Holder> {
@@ -937,7 +987,7 @@ mod platform {
 
     pub fn health(device: &Device) -> Result<Health, Error> {
         Err(Error::Io {
-            address: device.address(0..0),
+            address: Address::path(&device.path),
             source: io::ErrorKind::Unsupported.into(),
         })
     }
@@ -966,6 +1016,7 @@ mod platform {
 
     use super::{Health, Holder, COMMAND_BYTES, IDENTIFY_MODEL_NUMBER};
     use crate::direct::Device;
+    use crate::places::Address;
     use crate::Error;
 
     const SYS_BLOCK: &str = "/sys/class/block";
@@ -1062,11 +1113,11 @@ mod platform {
         match unsafe { libc::ioctl(device.as_raw_fd(), NVME_IOCTL_ADMIN_CMD, &mut command) } {
             0 => Ok(()),
             status if status < 0 => Err(Error::Io {
-                address: device.address(0..0),
+                address: Address::path(&device.path),
                 source: io::Error::last_os_error(),
             }),
             _ => Err(Error::Geometry {
-                address: device.address(0..0),
+                address: Address::path(&device.path),
                 query,
             }),
         }
@@ -1076,7 +1127,7 @@ mod platform {
         // SAFETY: `NVME_IOCTL_ID` takes no argument and returns the namespace ID of the node.
         let namespace = unsafe { libc::ioctl(device.as_raw_fd(), NVME_IOCTL_ID) };
         let namespace = u32::try_from(namespace).map_err(|_| Error::Io {
-            address: device.address(0..0),
+            address: Address::path(&device.path),
             source: io::Error::last_os_error(),
         })?;
         let mut identify = [0; IDENTIFY_BYTES];
@@ -1088,7 +1139,7 @@ mod platform {
         let formats = (OPCODE_IDENTIFY, namespace, IDENTIFY_NAMESPACE);
         admin(device, formats, &mut identify, "Identify Namespace")?;
         let logical_block = formatted_block(&identify).ok_or_else(|| Error::Geometry {
-            address: device.address(0..0),
+            address: Address::path(&device.path),
             query: "Identify Namespace LBA format",
         })?;
         let mut smart = [0; SMART_BYTES];
@@ -1112,10 +1163,7 @@ mod platform {
 
     /// The logical block of the LBA format in force, from Identify Namespace.
     fn formatted_block(identify: &[u8; IDENTIFY_BYTES]) -> Option<NonZeroU32> {
-        let (formats, formatted) = (
-            identify[IDENTIFY_FORMATS_AT],
-            identify[IDENTIFY_FORMATTED_AT],
-        );
+        let (formats, formatted) = (identify[IDENTIFY_FORMATS_AT], identify[IDENTIFY_FORMATTED_AT]);
         let mut format = formatted & FORMATTED_LOW_MASK;
         if formats > FORMATTED_LOW_MASK {
             format |= (formatted & FORMATTED_HIGH_MASK) >> FORMATTED_HIGH_SHIFT;
@@ -1130,8 +1178,7 @@ mod platform {
 
     /// Whether `name` is an NVMe namespace node, `nvme<controller>n<namespace>`.
     fn namespace_node(name: &str) -> bool {
-        let numbered =
-            |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+        let numbered = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
         name.strip_prefix("nvme")
             .and_then(|rest| rest.split_once('n'))
             .is_some_and(|(controller, namespace)| numbered(controller) && numbered(namespace))
@@ -1174,10 +1221,7 @@ mod platform {
         };
         let mut holders = Vec::new();
         for process in processes.flatten() {
-            let pid = process
-                .file_name()
-                .to_str()
-                .and_then(|pid| pid.parse::<u32>().ok());
+            let pid = process.file_name().to_str().and_then(|pid| pid.parse::<u32>().ok());
             let Some(pid) = pid.filter(|&pid| pid != own) else {
                 continue;
             };
@@ -1217,8 +1261,7 @@ mod platform {
             .filter(|name| {
                 let class = Path::new(SYS_BLOCK).join(name);
                 let node = Path::new(DEV).join(name);
-                let held = fs::read_dir(class.join("holders"))
-                    .is_ok_and(|mut holders| holders.next().is_some());
+                let held = fs::read_dir(class.join("holders")).is_ok_and(|mut holders| holders.next().is_some());
                 let device = fs::read_to_string(class.join("dev")).unwrap_or_default();
                 let swapped = swaps
                     .lines()
@@ -1241,8 +1284,7 @@ mod platform {
             .filter(|entry| entry.file_name().to_string_lossy().contains(':'))
             .map(|entry| entry.path())
             .filter(|device| {
-                fs::read_to_string(device.join("class"))
-                    .is_ok_and(|class| class.trim().starts_with(PCI_CLASS_NVME))
+                fs::read_to_string(device.join("class")).is_ok_and(|class| class.trim().starts_with(PCI_CLASS_NVME))
             })
             .filter_map(|device| fs::canonicalize(device).ok())
             .collect();
@@ -1295,14 +1337,7 @@ mod tests {
                 },
             ),
             dataset(1, "", graph()),
-            dataset(
-                1,
-                "",
-                Owner::Directory {
-                    database,
-                    medium: 1,
-                },
-            ),
+            dataset(1, "", Owner::Directory { database, medium: 1 }),
             dataset(1, "", Owner::Foreign),
             dataset(2, "data/EN/", Owner::Parquet { files: 1 }),
             dataset(2, "data/de", Owner::Parquet { files: 1 }),
@@ -1321,8 +1356,11 @@ mod tests {
             (19..20, GRAPH_MARK),
         ];
         let bar = |columns| slot_bar(20, columns, runs.iter().cloned());
-        assert_eq!(bar(20), "██···███·▒··▓▓·····█");
-        // Narrower than the drive, a column shows the first run among the slots it covers.
-        assert_eq!(bar(10), "█·██▒·▓··█");
+        // Each label starts under the column its mark starts in, and the slot count ends the line.
+        assert_eq!(bar(20), ["██···███·▒··▓▓·····█", "0 2  5  8 10  14  20"]);
+        // Narrower than the drive, a column shows the first run among the slots it covers, and a
+        // label that would touch another is dropped.
+        assert_eq!(bar(10)[0], "█·██▒·▓··█");
+        assert_eq!(bar(10)[1], "0 5 9   20");
     }
 }

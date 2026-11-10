@@ -179,9 +179,7 @@ pub fn parse_address(text: &str) -> Result<Address, AddressError> {
 /// Where the `@` opening an extent sits: the last one, when a digit follows it.
 fn extent_start(text: &[u8]) -> Option<usize> {
     let at = text.iter().rposition(|&byte| byte == b'@')?;
-    text.get(at + 1)
-        .is_some_and(u8::is_ascii_digit)
-        .then_some(at)
+    text.get(at + 1).is_some_and(u8::is_ascii_digit).then_some(at)
 }
 
 /// A whole decimal number of bytes with an optional binary unit, `None` past `u64` or on an unknown unit.
@@ -215,27 +213,20 @@ pub fn byte_count(bytes: u64) -> String {
         .unwrap_or(0);
     match unit {
         0 => bytes.to_string(),
-        _ => format!(
-            "{}{}",
-            bytes >> (unit as u32 * BINARY_UNIT_SHIFT),
-            BINARY_UNITS[unit]
-        ),
+        _ => format!("{}{}", bytes >> (unit as u32 * BINARY_UNIT_SHIFT), BINARY_UNITS[unit]),
     }
 }
 
-/// `bytes` to three significant digits in binary units, as the screens show sizes.
+/// `bytes` to three significant digits in binary units from KiB up, so every size carries a unit of
+/// one width and sizes right-aligned in a column line up on their unit.
 pub fn size(bytes: u64) -> String {
-    let unit = (0..BINARY_UNITS.len())
+    let unit = (1..BINARY_UNITS.len())
         .rev()
         .find(|&unit| bytes >> (unit as u32 * BINARY_UNIT_SHIFT) != 0)
-        .unwrap_or(0);
+        .unwrap_or(1);
     let shift = unit as u32 * BINARY_UNIT_SHIFT;
     let value = bytes as f64 / (1u64 << shift) as f64;
-    format!(
-        "{} {}",
-        rounded(value, bytes >> shift, unit),
-        BINARY_UNITS[unit]
-    )
+    format!("{} {}", rounded(value, bytes >> shift, unit), BINARY_UNITS[unit])
 }
 
 /// `value` with as many decimals as three significant digits leave past `whole`, none in the
@@ -333,9 +324,7 @@ impl Place {
 impl fmt::Display for Place {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Place::Folder(path) | Place::File(path) | Place::Drive(path) => {
-                formatter.write_str(&home_relative(path))
-            }
+            Place::Folder(path) | Place::File(path) | Place::Drive(path) => formatter.write_str(&home_relative(path)),
             Place::Bucket(object) => match object.key.trim_end_matches('/') {
                 "" => write!(formatter, "{S3_SCHEME}{}", object.bucket),
                 prefix => write!(formatter, "{S3_SCHEME}{}/{prefix}", object.bucket),
@@ -401,19 +390,15 @@ impl S3 {
             .key(&object.key)
             .range(format!("bytes=0-{}", bytes - 1));
         let output = self.block_on(get.send()).map_err(s3_failed(object))?;
-        let body = self
-            .block_on(output.body.collect())
-            .map_err(|source| Error::Io {
-                address: Address::whole(Location::Bucket(object.clone())),
-                source: source.into(),
-            })?;
+        let body = self.block_on(output.body.collect()).map_err(|source| Error::Io {
+            address: Address::whole(Location::Bucket(object.clone())),
+            source: source.into(),
+        })?;
         Ok(body.into_bytes().to_vec())
     }
 }
 
-pub fn s3_failed<Source: Into<aws_sdk_s3::Error>>(
-    object: &ObjectAddress,
-) -> impl FnOnce(Source) -> Error + '_ {
+pub fn s3_failed<Source: Into<aws_sdk_s3::Error>>(object: &ObjectAddress) -> impl FnOnce(Source) -> Error + '_ {
     move |source| Error::S3 {
         object: object.clone(),
         source: Box::new(source.into()),
@@ -455,30 +440,18 @@ mod tests {
         assert_eq!(suffixed, path("/data/backup@2GiB", 0, 0));
         assert_eq!(suffixed.to_string(), "/data/backup@2GiB@0");
         let whole = |text: &str| Address::path(Path::new(text));
-        assert_eq!(
-            parse_address("/data/user@host").unwrap(),
-            whole("/data/user@host")
-        );
+        assert_eq!(parse_address("/data/user@host").unwrap(), whole("/data/user@host"));
         assert_eq!(parse_address("/data/a@+5").unwrap(), whole("/data/a@+5"));
 
         assert_eq!(parse_address("/dev/nvme1n1@12QiB"), Err(AddressError::Base));
-        assert_eq!(
-            parse_address("/dev/nvme1n1@1GiB+"),
-            Err(AddressError::Length)
-        );
-        assert_eq!(
-            parse_address("/dev/nvme1n1@1GiB++1"),
-            Err(AddressError::Length)
-        );
+        assert_eq!(parse_address("/dev/nvme1n1@1GiB+"), Err(AddressError::Length));
+        assert_eq!(parse_address("/dev/nvme1n1@1GiB++1"), Err(AddressError::Length));
         assert_eq!(
             parse_address("/dev/nvme1n1@16777216TiB"),
             Err(AddressError::Base),
             "2^64 bytes overflows"
         );
-        assert_eq!(
-            parse_address("/dev/nvme1n1@16777215TiB").unwrap().base,
-            u64::MAX << 40
-        );
+        assert_eq!(parse_address("/dev/nvme1n1@16777215TiB").unwrap().base, u64::MAX << 40);
         assert_eq!(parse_address("@0"), Err(AddressError::NoLocation));
 
         let bucket = parse_address("s3://bigger-ann").unwrap();

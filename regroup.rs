@@ -14,8 +14,8 @@ use crate::direct::{Access, Device};
 use crate::free::{refuse_held, FreePlan};
 use crate::list::plural;
 use crate::places::Address;
-use crate::slots::{self, first_free_run, slot_extent, SpanOwner};
-use crate::{Error, SLOT_SHIFT};
+use crate::slots::{self, first_free_run, slot_extent, Span, SpanOwner};
+use crate::Error;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Move {
@@ -29,6 +29,8 @@ pub struct RegroupPlan {
     pub drive: PathBuf,
     pub moves: Vec<Move>,
     pub stays: Vec<Range<u32>>,
+    /// The bytes the moved files hold, which the moves copy.
+    pub bytes: u64,
 }
 
 /// The moves packing `spans`, each a run of slots and whether it may move, towards slot 0, and the
@@ -37,11 +39,7 @@ pub fn plan(spans: &[(Range<u32>, bool)]) -> (Vec<Move>, Vec<Range<u32>>) {
     let mut occupied: Vec<Range<u32>> = spans.iter().map(|(run, _)| run.clone()).collect();
     let (mut moves, mut stays) = (Vec::new(), Vec::new());
     let mut target = 0;
-    for (index, (run, _)) in spans
-        .iter()
-        .enumerate()
-        .filter(|(_, (_, movable))| *movable)
-    {
+    for (index, (run, _)) in spans.iter().enumerate().filter(|(_, (_, movable))| *movable) {
         let slots = run.end - run.start;
         if run.start <= target {
             target = target.max(run.end);
@@ -82,8 +80,14 @@ impl RegroupPlan {
             })
             .collect();
         let (moves, stays) = plan(&spans);
+        let moved = |span: &&Span| moves.iter().any(|step| step.from_slot == span.first_slot);
+        let bytes = map.spans.iter().filter(moved).map(|span| match &span.owner {
+            SpanOwner::SafeGraphs(graph) => graph.file_bytes,
+            _ => 0,
+        });
         Ok(RegroupPlan {
             drive: drive.to_path_buf(),
+            bytes: bytes.sum(),
             moves,
             stays,
         })
@@ -92,8 +96,7 @@ impl RegroupPlan {
     /// Copies each run to its new place, then frees where it was, calling `report` after every
     /// group of parts and stopping after the group in flight once it breaks.
     pub fn run(&self, mut report: impl FnMut(&Progress) -> ControlFlow<()>) -> Result<(), Error> {
-        let slots: u64 = self.moves.iter().map(|step| u64::from(step.slots)).sum();
-        let mut progress = Progress::new(slots << SLOT_SHIFT);
+        let mut progress = Progress::new(self.bytes);
         for step in &self.moves {
             let run = |first| Address::extent(&self.drive, slot_extent(first, step.slots));
             let source = run(step.from_slot);
@@ -102,7 +105,8 @@ impl RegroupPlan {
                 progress.bytes_done = done + copied.bytes_done;
                 report(&progress)
             })?;
-            FreePlan::new(&source)?.run(|_| report(&progress))?;
+            // The source is free once its first blocks are zeroed, so its discards run to their end.
+            FreePlan::new(&source)?.run(|_| ControlFlow::Continue(()))?;
         }
         Ok(())
     }
@@ -122,11 +126,7 @@ impl fmt::Display for RegroupPlan {
         write!(formatter, "regroup {}: {moves}", self.drive.display())?;
         match self.stays.len() {
             0 => Ok(()),
-            stays => write!(
-                formatter,
-                ", {} with no room before",
-                plural(stays as u64, "run")
-            ),
+            stays => write!(formatter, ", {} with no room before", plural(stays as u64, "run")),
         }
     }
 }
@@ -175,19 +175,9 @@ mod tests {
             (21..22, true),
         ];
         let (moves, stays) = plan(&spans);
-        assert_eq!(
-            moves,
-            [
-                step(2, 0, 2),
-                step(9, 2, 3),
-                step(13, 7, 4),
-                step(21, 11, 1)
-            ]
-        );
+        assert_eq!(moves, [step(2, 0, 2), step(9, 2, 3), step(13, 7, 4), step(21, 11, 1)]);
         assert!(stays.is_empty());
-        assert!(moves
-            .iter()
-            .all(|step| step.to_slot + step.slots <= step.from_slot));
+        assert!(moves.iter().all(|step| step.to_slot + step.slots <= step.from_slot));
 
         // A run that finds no room before it stays.
         let (moves, stays) = plan(&[(0..2, true), (3..4, false), (4..7, true)]);

@@ -19,15 +19,12 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::copy::{CopyPlan, Progress};
 use crate::free::FreePlan;
-use crate::list::{
-    self, dataset_bytes, drive_line, index, slot_bar, slot_range, Medium, Owner, Survey,
-    SAFEGRAPHS_SUFFIX,
-};
+use crate::list::{self, dataset_bytes, index, plural, slot_bar, slot_range, Medium, Owner, Survey, SAFEGRAPHS_SUFFIX};
 use crate::places::{size, Address, Place, S3};
 use crate::regroup::RegroupPlan;
 use crate::slots::{slot_extent, SLOT_BYTES};
@@ -39,8 +36,10 @@ const BORDER_CELLS: u16 = 2;
 const LINE_ROWS: u16 = 1;
 /// The terminal the screens draw on, which terminal errors name.
 const TERMINAL: &str = "/dev/tty";
-const DRIVE_LINE_INDENT: &str = "  ";
-const SLOT_BAR_LABEL: &str = "slots ";
+/// The slot bar and the slot labels under it.
+const SLOT_BAR_ROWS: u16 = 2;
+/// The Places pane takes at most this fraction of the width, so the Datasets pane always shows.
+const PLACES_PANE_SHARE: u16 = 2;
 const BEFORE: &str = "before ";
 const AFTER: &str = "after  ";
 const SELECTED_MARKER: &str = "› ";
@@ -172,9 +171,7 @@ impl Browser<'_> {
         sender: &Sender<Message>,
     ) -> Result<(), Error> {
         loop {
-            terminal
-                .draw(|frame| self.draw(frame))
-                .map_err(terminal_error)?;
+            terminal.draw(|frame| self.draw(frame)).map_err(terminal_error)?;
             match receiver.recv().expect("the event loop holds a sender") {
                 Message::Terminal(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                     if self.key(key.code, sender).is_break() {
@@ -184,17 +181,12 @@ impl Browser<'_> {
                 Message::Terminal(_) => {}
                 Message::TerminalFailed(source) => return Err(terminal_error(source)),
                 Message::Progress(progress) => {
-                    if let Screen::Running {
-                        progress: shown, ..
-                    } = &mut self.screen
-                    {
+                    if let Screen::Running { progress: shown, .. } = &mut self.screen {
                         *shown = progress;
                     }
                 }
                 Message::Finished(result) => {
-                    let Screen::Running { job, .. } =
-                        std::mem::replace(&mut self.screen, Screen::Panes)
-                    else {
+                    let Screen::Running { job, .. } = std::mem::replace(&mut self.screen, Screen::Panes) else {
                         unreachable!("only a running job finishes");
                     };
                     self.report = match result {
@@ -202,9 +194,7 @@ impl Browser<'_> {
                         Err(error) => Report::Failed(error),
                     };
                     self.survey = list::survey(self.addresses, self.endpoint)?;
-                    self.place = self
-                        .place
-                        .min(index(self.survey.places.len()).saturating_sub(1));
+                    self.place = self.place.min(index(self.survey.places.len()).saturating_sub(1));
                     self.row = 0;
                 }
             }
@@ -214,12 +204,7 @@ impl Browser<'_> {
     /// The selected place's datasets the filter lets through.
     fn visible(&self) -> impl Iterator<Item = u32> + Clone + '_ {
         self.survey.datasets_of(self.place).filter(|&dataset| {
-            self.filter.is_empty()
-                || self
-                    .survey
-                    .dataset_name(dataset)
-                    .to_lowercase()
-                    .contains(&self.filter)
+            self.filter.is_empty() || self.survey.dataset_name(dataset).to_lowercase().contains(&self.filter)
         })
     }
 
@@ -248,8 +233,7 @@ impl Browser<'_> {
             }
             (Screen::Copy { .. } | Screen::Confirm(_), KeyCode::Esc) => self.screen = Screen::Panes,
             (Screen::Confirm(_), KeyCode::Char('y')) => {
-                let Screen::Confirm(job) = std::mem::replace(&mut self.screen, Screen::Panes)
-                else {
+                let Screen::Confirm(job) = std::mem::replace(&mut self.screen, Screen::Panes) else {
                     unreachable!("the screen was matched as a confirmation");
                 };
                 self.start(job, sender);
@@ -266,9 +250,7 @@ impl Browser<'_> {
                 match code {
                     KeyCode::Up | KeyCode::Down => {
                         let stride = if code == KeyCode::Down { 1 } else { places - 1 };
-                        if let Some(next) =
-                            next_destination(&self.survey, dataset, *destination, stride)
-                        {
+                        if let Some(next) = next_destination(&self.survey, dataset, *destination, stride) {
                             (*destination, *run) = (next, 0);
                         }
                     }
@@ -293,12 +275,8 @@ impl Browser<'_> {
         let selected = self.visible().nth(self.row as usize);
         match (code, self.focus) {
             (KeyCode::Char('q'), _) => return ControlFlow::Break(()),
-            (KeyCode::Up, Focus::Places) => {
-                (self.place, self.row) = (self.place.saturating_sub(1), 0)
-            }
-            (KeyCode::Down, Focus::Places) => {
-                (self.place, self.row) = ((self.place + 1).min(last_place), 0)
-            }
+            (KeyCode::Up, Focus::Places) => (self.place, self.row) = (self.place.saturating_sub(1), 0),
+            (KeyCode::Down, Focus::Places) => (self.place, self.row) = ((self.place + 1).min(last_place), 0),
             (KeyCode::Up, Focus::Datasets) => self.row = self.row.saturating_sub(1),
             (KeyCode::Down, Focus::Datasets) => self.row = (self.row + 1).min(last_row),
             (KeyCode::Right | KeyCode::Enter, Focus::Places) => self.focus = Focus::Datasets,
@@ -318,9 +296,7 @@ impl Browser<'_> {
                             run: 0,
                         }
                     }
-                    None => {
-                        self.report = Report::Note("no other place takes a copy of this dataset")
-                    }
+                    None => self.report = Report::Note("no other place takes a copy of this dataset"),
                 }
             }
             (KeyCode::Char('f'), Focus::Datasets) => {
@@ -333,8 +309,7 @@ impl Browser<'_> {
                         )
                 });
                 let Some(dataset) = freeable else {
-                    self.report =
-                        Report::Note("f frees a SafeGraphs or UStore run on a drive; pick one");
+                    self.report = Report::Note("f frees a SafeGraphs or UStore run on a drive; pick one");
                     return ControlFlow::Continue(());
                 };
                 match FreePlan::new(&self.survey.dataset_address(dataset)) {
@@ -392,11 +367,7 @@ impl Browser<'_> {
             let _ = worker_sender.send(Message::Finished(result));
         });
         let progress = Progress::new(job.bytes());
-        self.screen = Screen::Running {
-            job,
-            progress,
-            stop,
-        };
+        self.screen = Screen::Running { job, progress, stop };
     }
 
     fn draw(&self, frame: &mut Frame) {
@@ -409,31 +380,37 @@ impl Browser<'_> {
         .areas(frame.area());
         let bold = Style::new().add_modifier(Modifier::BOLD);
         frame.render_widget(Paragraph::new(self.survey.summary()).style(bold), header);
-        let places: Vec<Vec<String>> = (0..index(self.survey.places.len()))
-            .map(|place| self.place_lines(place))
-            .collect();
+        // Names give way first, so the Places pane never takes more than its share.
+        let first_line = |rows: &[Vec<String>]| rows.iter().map(|lines| lines[0].chars().count()).max();
+        let chrome = usize::from(BORDER_CELLS) + SELECTED_MARKER.chars().count();
+        let share = usize::from(body.width / PLACES_PANE_SHARE);
+        let mut places = self.survey.place_rows(usize::MAX);
+        let excess = (first_line(&places).unwrap_or_default() + chrome).saturating_sub(share);
+        if excess > 0 {
+            let names = self
+                .survey
+                .places
+                .iter()
+                .map(|place| place.to_string().chars().count())
+                .max();
+            places = self.survey.place_rows(names.unwrap_or_default().saturating_sub(excess));
+        }
         let widest = places
             .iter()
             .flatten()
             .map(|line| line.chars().count())
             .max()
             .unwrap_or_default();
-        let width = u16::try_from(widest)
-            .unwrap_or(u16::MAX)
-            .saturating_add(BORDER_CELLS);
-        let [places_area, datasets] =
-            Layout::horizontal([Constraint::Length(width), Constraint::Min(0)]).areas(body);
+        let width = u16::try_from((widest + chrome).min(share)).unwrap_or(u16::MAX);
+        let [places_area, datasets] = Layout::horizontal([Constraint::Length(width), Constraint::Min(0)]).areas(body);
         let items: Vec<ListItem> = places
             .into_iter()
-            .map(|lines| ListItem::new(lines.into_iter().map(Line::from).collect::<Vec<_>>()))
+            .map(|lines| ListItem::new(lines.join("\n")))
             .collect();
         let mut state = ListState::default().with_selected(Some(self.place as usize));
-        let list = List::new(items).block(self.pane(" Places ".into(), Focus::Places));
-        frame.render_stateful_widget(
-            list.highlight_style(Style::new().add_modifier(Modifier::REVERSED)),
-            places_area,
-            &mut state,
-        );
+        let title = format!(" {} ", plural(index(self.survey.places.len()).into(), "place"));
+        let list = highlighted(List::new(items).block(self.pane(title, Focus::Places)));
+        frame.render_stateful_widget(list, places_area, &mut state);
         self.draw_datasets(frame, datasets);
         let report = match &self.report {
             Report::Ready => String::new(),
@@ -449,10 +426,7 @@ impl Browser<'_> {
             ),
             Screen::Filter => (" Filter ", "type to filter   Enter keep   Esc clear"),
             Screen::Help => (" Help ", "any key returns"),
-            Screen::Copy { .. } => (
-                " Copy ",
-                "↑↓ destination   ←→ free run   Enter plan   Esc back",
-            ),
+            Screen::Copy { .. } => (" Copy ", "↑↓ destination   ←→ free run   Enter plan   Esc back"),
             Screen::Confirm(Job::Copy { .. }) => (" Copy ", "y start   Esc back"),
             Screen::Confirm(Job::Free { .. }) => (" Free ", "y free   Esc back"),
             Screen::Confirm(Job::Regroup { .. }) => (" Regroup ", "y regroup   Esc back"),
@@ -465,30 +439,21 @@ impl Browser<'_> {
         }
     }
 
-    /// A place's line, and a drive's health under it.
-    fn place_lines(&self, place: u32) -> Vec<String> {
-        let mut lines = vec![self.survey.place_line(place)];
-        if let Medium::Drive(drive) = &self.survey.media[place as usize] {
-            lines.push(format!("{DRIVE_LINE_INDENT}{}", drive_line(drive)));
-        }
-        lines
-    }
-
     fn draw_datasets(&self, frame: &mut Frame, area: Rect) {
         let Some(location) = self.survey.places.get(self.place as usize) else {
             frame.render_widget(self.pane(" Datasets ".into(), Focus::Datasets), area);
             return;
         };
-        let block = self.pane(format!(" Datasets in {location} "), Focus::Datasets);
+        let shown = plural(self.visible().count() as u64, "dataset");
+        let block = self.pane(format!(" {shown} in {location} "), Focus::Datasets);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let drive = match &self.survey.media[self.place as usize] {
             Medium::Drive(drive) => Some(drive),
             _ => None,
         };
-        let bar_rows = if drive.is_some() { LINE_ROWS } else { 0 };
-        let [rows, bar] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(bar_rows)]).areas(inner);
+        let bar_rows = if drive.is_some() { SLOT_BAR_ROWS } else { 0 };
+        let [rows, bar] = Layout::vertical([Constraint::Min(0), Constraint::Length(bar_rows)]).areas(inner);
         let items: Vec<ListItem> = self
             .survey
             .dataset_rows(self.visible())
@@ -497,12 +462,10 @@ impl Browser<'_> {
             .collect();
         let selected = (self.focus == Focus::Datasets).then_some(self.row as usize);
         let mut state = ListState::default().with_selected(selected);
-        let list = List::new(items).highlight_style(Style::new().add_modifier(Modifier::REVERSED));
-        frame.render_stateful_widget(list, rows, &mut state);
+        frame.render_stateful_widget(highlighted(List::new(items)), rows, &mut state);
         if let Some(drive) = drive {
-            let columns = u32::from(bar.width).saturating_sub(index(SLOT_BAR_LABEL.len()));
-            let line = slot_bar(drive.slots, columns, self.drive_runs(self.place));
-            frame.render_widget(Paragraph::new(format!("{SLOT_BAR_LABEL}{line}")), bar);
+            let lines = slot_bar(drive.slots, bar.width.into(), self.drive_runs(self.place));
+            frame.render_widget(Paragraph::new(lines.join("\n")), bar);
         }
     }
 
@@ -536,19 +499,14 @@ impl Browser<'_> {
             } => self.copy_lines(*dataset, *destination, *run),
             Screen::Confirm(Job::Copy { plan, .. }) => vec![plan.to_string()],
             Screen::Confirm(Job::Free { plan, dataset }) => {
-                let (name, bytes) = (
-                    survey.dataset_name(*dataset),
-                    dataset_bytes(survey.dataset(*dataset)),
-                );
+                let (name, bytes) = (survey.dataset_name(*dataset), dataset_bytes(survey.dataset(*dataset)));
                 vec![format!(
                     "{plan}, {name} {}, {}",
                     size(bytes),
                     survey.copies_line(*dataset)
                 )]
             }
-            Screen::Confirm(Job::Regroup { plan, place }) => {
-                self.regroup_lines(*place, plan, width)
-            }
+            Screen::Confirm(Job::Regroup { plan, place }) => self.regroup_lines(*place, plan, width),
             Screen::Running { job, progress, .. } => vec![job.to_string(), progress.to_string()],
         }
     }
@@ -565,9 +523,7 @@ impl Browser<'_> {
             "{name} {owner}, {bytes} from {}",
             survey.places[found.place as usize]
         )];
-        for place in
-            (0..index(survey.places.len())).filter(|&place| takes_copy(survey, dataset, place))
-        {
+        for place in (0..index(survey.places.len())).filter(|&place| takes_copy(survey, dataset, place)) {
             let marker = if place == destination {
                 SELECTED_MARKER
             } else {
@@ -593,31 +549,22 @@ impl Browser<'_> {
             return Vec::new();
         };
         let columns = u32::from(width).saturating_sub(index(BEFORE.len()));
-        let moved = |(run, mark): (Range<u32>, char)| match plan
-            .moves
-            .iter()
-            .find(|step| step.from_slot == run.start)
-        {
+        let moved = |(run, mark): (Range<u32>, char)| match plan.moves.iter().find(|step| step.from_slot == run.start) {
             Some(step) => (step.to_slot..step.to_slot + run.len() as u32, mark),
             None => (run, mark),
         };
         let mut lines = vec![
-            format!(
-                "{BEFORE}{}",
-                slot_bar(drive.slots, columns, self.drive_runs(place))
-            ),
+            format!("{BEFORE}{}", slot_bar(drive.slots, columns, self.drive_runs(place))[0]),
             format!(
                 "{AFTER}{}",
-                slot_bar(drive.slots, columns, self.drive_runs(place).map(moved))
+                slot_bar(drive.slots, columns, self.drive_runs(place).map(moved))[0]
             ),
         ];
         for step in &plan.moves {
             let name = self
                 .survey
                 .datasets_of(place)
-                .find(|&dataset| {
-                    slot_range(&self.survey.dataset(dataset).extent).start == step.from_slot
-                })
+                .find(|&dataset| slot_range(&self.survey.dataset(dataset).extent).start == step.from_slot)
                 .map(|dataset| self.survey.dataset_name(dataset))
                 .unwrap_or_default();
             lines.push(format!("move {name}: {step}"));
@@ -642,7 +589,8 @@ impl Job {
     fn bytes(&self) -> u64 {
         match self {
             Job::Copy { plan, .. } => plan.bytes,
-            Job::Free { .. } | Job::Regroup { .. } => 0,
+            Job::Regroup { plan, .. } => plan.bytes,
+            Job::Free { .. } => 0,
         }
     }
 }
@@ -655,6 +603,14 @@ impl fmt::Display for Job {
             Job::Regroup { plan, .. } => plan.fmt(formatter),
         }
     }
+}
+
+/// A list whose selected row is reversed and marked, every row indented by the mark's width.
+fn highlighted(list: List<'_>) -> List<'_> {
+    let reversed = Style::new().add_modifier(Modifier::REVERSED);
+    list.highlight_style(reversed)
+        .highlight_symbol(SELECTED_MARKER)
+        .highlight_spacing(HighlightSpacing::Always)
 }
 
 /// A bordered box sized to its lines, centered over `area`.
@@ -683,10 +639,7 @@ fn draw_overlay(frame: &mut Frame, area: Rect, title: &str, lines: Vec<String>) 
         .areas(column);
     frame.render_widget(Clear, overlay);
     let text: Vec<Line> = lines.into_iter().map(Line::from).collect();
-    frame.render_widget(
-        Paragraph::new(text).block(Block::bordered().title(title)),
-        overlay,
-    );
+    frame.render_widget(Paragraph::new(text).block(Block::bordered().title(title)), overlay);
 }
 
 fn is_drive(survey: &Survey, place: u32) -> bool {
@@ -698,10 +651,7 @@ fn is_drive(survey: &Survey, place: u32) -> bool {
 fn takes_copy(survey: &Survey, dataset: u32, place: u32) -> bool {
     let found = survey.dataset(dataset);
     place != found.place
-        && match (
-            &survey.places[place as usize],
-            &survey.media[place as usize],
-        ) {
+        && match (&survey.places[place as usize], &survey.media[place as usize]) {
             (_, Medium::Unreachable(_)) => false,
             (Place::Folder(_) | Place::Bucket(_), _) => true,
             (Place::Drive(_), _) => matches!(found.owner, Owner::SafeGraphs(_)),
@@ -752,10 +702,7 @@ fn slots_needed(survey: &Survey, dataset: u32) -> u32 {
 /// file name for a slot run, which carries none of its own.
 fn copy_destination(survey: &Survey, dataset: u32, destination: u32, run: u32) -> Address {
     if let Some((first, _)) = runs_for(survey, destination, dataset).nth(run as usize) {
-        return survey.address(
-            destination,
-            slot_extent(first, slots_needed(survey, dataset)),
-        );
+        return survey.address(destination, slot_extent(first, slots_needed(survey, dataset)));
     }
     let address = survey.address(destination, 0..0);
     let found = survey.dataset(dataset);
