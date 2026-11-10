@@ -1,0 +1,50 @@
+[package]
+authors = ["Ash Vardanian <1983160+ashvardanian@users.noreply.github.com>"]
+categories = ["command-line-utilities", "filesystem"]
+description = "Where each dataset lives across local folders, raw NVMe slots and S3, and how to copy, free and regroup them"
+edition = "2021"
+rust-version = "1.100"
+keywords = ["nvme", "s3", "sha256", "datasets", "tui"]
+license = "Apache-2.0"
+name = "diskslots"
+readme = "README.md"
+repository = "https://github.com/unum-cloud/DiskSlots"
+version = "0.1.0"
+
+[dependencies]
+allocator-api2 = "0.4"                                                              # Allocator-aware, fallible buffers
+aws-config = "1"                                                                    # Credential, profile and region resolution
+aws-sdk-s3 = "1"                                                                    # Multipart uploads with SHA-256 per part
+bytes = "1"                                                                         # Lends pooled buffers to upload bodies
+clap = { version = "4.5", features = ["derive"] }                                   # CLI argument parsing
+forkunion = { version = "4.0.0-rc.1", git = "https://github.com/ashvardanian/ForkUnion" } # Reads and writes parts on the drive's NUMA node
+futures-util = "0.3"                                                                # Bounds the S3 parts in flight
+jsontape = "0.1"                                                                    # UStore manifests
+libc = "0.2"                                                                        # O_DIRECT, filesystem capacity and the block ioctls
+ratatui = "0.30"                                                                    # The screens, over crossterm
+safegraphs = { version = "0.1", git = "https://github.com/safegraphs/SafeGraphs" } # Header-only reads of slot runs
+stringzilla = { version = "6.0.0-rc.1", git = "https://github.com/ashvardanian/StringZilla" } # Batched SHA-256
+tokio = { version = "1", features = ["rt"] }                                        # Drives the S3 client
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+codegen-units = 1 # Better optimization, slower compile
+lto = true        # Link-time optimization
+opt-level = 3     # Maximum optimization
+strip = true      # Strip symbols for smaller binary
+
+[[bin]]
+name = "diskslots"
+path = "diskslots.rs"
+
+[lints.clippy]
+cognitive_complexity = "deny"
+too_many_arguments = "deny"
+fn_params_excessive_bools = "deny"
+needless_collect = "deny"
+redundant_clone = "deny"
+unnecessary_to_owned = "deny"
+inefficient_to_string = "deny"
+large_stack_arrays = "deny"
