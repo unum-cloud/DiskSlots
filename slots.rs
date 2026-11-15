@@ -4,8 +4,10 @@
 //! boundary. Mapping reads the first logical block of each slot and checks it against each owner's
 //! own magic alone: a SafeGraphs file whose header ends inside its slot, parses and whose extent
 //! fits the drive covers as many slots as its length needs; a UStore owner block names the
-//! database holding that one slot; an all-zero block is free; anything else is foreign, one slot
-//! long, and never written.
+//! database holding that one slot; a dataset exchange file whose head declares its length covers
+//! as many slots as that length needs, and one whose length sits in a footer covers one slot and is
+//! never written; an all-zero block is free; anything else is foreign, one slot long, and never
+//! written.
 
 use std::ops::Range;
 
@@ -98,12 +100,173 @@ pub struct Graph {
     pub header_digest: sz::Sha256Digest,
 }
 
+/// Each format's magic and the byte it starts at; safetensors carries none and is tried last.
+const TABLE_MAGICS: [(TableFormat, usize, &[u8]); 8] = [
+    (TableFormat::Parquet, 0, b"PAR1"),
+    (TableFormat::ArrowFile, 0, b"ARROW1\0\0"),
+    (TableFormat::Orc, 0, b"ORC"),
+    (TableFormat::Numpy, 0, b"\x93NUMPY"),
+    (TableFormat::Sqlite, 0, b"SQLite format 3\0"),
+    (TableFormat::Hdf5, 0, b"\x89HDF\r\n\x1a\n"),
+    (TableFormat::DuckDb, 8, b"DUCK"),
+    (TableFormat::Gguf, 0, b"GGUF"),
+];
+const NUMPY_VERSION_AT: usize = 6;
+const NUMPY_LENGTH_AT: usize = 8;
+/// The item kinds whose descr digits count bytes, unlike `U`, which counts 4-byte characters.
+const NUMPY_BYTE_KINDS: [char; 7] = ['b', 'i', 'u', 'f', 'c', 'S', 'V'];
+const SAFETENSORS_JSON_AT: usize = 8;
+/// A longer safetensors header length is taken for other bytes, as no real header grows so long.
+const SAFETENSORS_HEADER_MAX: u64 = 100 << 20;
+const SQLITE_PAGE_BYTES_AT: usize = 16;
+const SQLITE_PAGES_AT: usize = 28;
+/// What a page size field of 1 stands for, as 65536 does not fit its two bytes.
+const SQLITE_PAGE_BYTES_MAX: u64 = 1 << 16;
+const HDF5_VERSION_AT: usize = 8;
+const HDF5_OFFSETS_AT: usize = 9;
+/// Where the base address starts; the extension address and then the end-of-file address follow.
+const HDF5_ADDRESSES_AT: usize = 12;
+
+/// A dataset exchange file recognized by its first page, with its length when the head declares it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Table {
+    pub format: TableFormat,
+    pub bytes: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableFormat {
+    Parquet,
+    ArrowFile,
+    Orc,
+    Numpy,
+    Safetensors,
+    Sqlite,
+    Hdf5,
+    DuckDb,
+    Gguf,
+}
+
+impl TableFormat {
+    pub fn name(self) -> &'static str {
+        match self {
+            TableFormat::Parquet => "Parquet",
+            TableFormat::ArrowFile => "Arrow",
+            TableFormat::Orc => "ORC",
+            TableFormat::Numpy => "NumPy",
+            TableFormat::Safetensors => "safetensors",
+            TableFormat::Sqlite => "SQLite",
+            TableFormat::Hdf5 => "HDF5",
+            TableFormat::DuckDb => "DuckDB",
+            TableFormat::Gguf => "GGUF",
+        }
+    }
+}
+
+impl Table {
+    /// The file opening `head`, if a format's magic or a whole safetensors header opens it.
+    pub fn read(head: &[u8]) -> Option<Self> {
+        let magic = TABLE_MAGICS
+            .iter()
+            .find(|(_, at, magic)| head.get(*at..).is_some_and(|rest| rest.starts_with(magic)));
+        let Some(&(format, ..)) = magic else {
+            let bytes = Some(safetensors_bytes(head)?);
+            return Some(Table {
+                format: TableFormat::Safetensors,
+                bytes,
+            });
+        };
+        let bytes = match format {
+            TableFormat::Numpy => numpy_bytes(head),
+            TableFormat::Sqlite => sqlite_bytes(head),
+            TableFormat::Hdf5 => hdf5_bytes(head),
+            _ => None,
+        };
+        // A zero length would cover no slot at all.
+        let bytes = bytes.filter(|&bytes| bytes != 0);
+        Some(Table { format, bytes })
+    }
+}
+
+/// Where the safetensors header opening `head` ends, if its length is plausible and JSON follows.
+pub fn safetensors_end(head: &[u8]) -> Option<usize> {
+    let length = u64::from_le_bytes(*head.first_chunk()?);
+    (length < SAFETENSORS_HEADER_MAX && head.get(SAFETENSORS_JSON_AT) == Some(&b'{'))
+        .then(|| SAFETENSORS_JSON_AT + length as usize)
+}
+
+/// The header, then the bytes up to the furthest tensor end.
+fn safetensors_bytes(head: &[u8]) -> Option<u64> {
+    let end = safetensors_end(head)?;
+    let header = jsontape::parse(head.get(SAFETENSORS_JSON_AT..end)?).ok()?;
+    let tensor_ends =
+        header
+            .as_object()?
+            .iter()
+            .filter_map(|(_, tensor)| match tensor.get("data_offsets")?.as_array()? {
+                [_, tensor_end] => tensor_end.as_u64(),
+                _ => None,
+            });
+    Some(end as u64 + tensor_ends.max()?)
+}
+
+/// The header, then the shape's items at the descr's item size.
+fn numpy_bytes(head: &[u8]) -> Option<u64> {
+    let (length_bytes, header_at) = match head.get(NUMPY_VERSION_AT)? {
+        1 => (size_of::<u16>(), NUMPY_LENGTH_AT + size_of::<u16>()),
+        2 | 3 => (size_of::<u32>(), NUMPY_LENGTH_AT + size_of::<u32>()),
+        _ => return None,
+    };
+    let mut length = [0; size_of::<u32>()];
+    length[..length_bytes].copy_from_slice(head.get(NUMPY_LENGTH_AT..header_at)?);
+    let end = header_at + u32::from_le_bytes(length) as usize;
+    let header = std::str::from_utf8(head.get(header_at..end)?).ok()?;
+    let value = |key: &str| Some(header.split_once(key)?.1.trim_start());
+    let descr = value("'descr':")?.strip_prefix('\'')?.split_once('\'')?.0;
+    let item_bytes: u64 = descr
+        .trim_start_matches(['<', '>', '|', '='])
+        .strip_prefix(NUMPY_BYTE_KINDS)?
+        .parse()
+        .ok()?;
+    let shape = value("'shape':")?.strip_prefix('(')?.split_once(')')?.0;
+    let items = shape
+        .split(',')
+        .map(str::trim)
+        .filter(|extent| !extent.is_empty())
+        .try_fold(1u64, |items, extent| items.checked_mul(extent.parse().ok()?))?;
+    items.checked_mul(item_bytes)?.checked_add(end as u64)
+}
+
+/// The page size times the page count, which a database that predates the count leaves at zero.
+fn sqlite_bytes(head: &[u8]) -> Option<u64> {
+    let page_bytes = u16::from_be_bytes(*head.get(SQLITE_PAGE_BYTES_AT..)?.first_chunk()?);
+    let pages = u32::from_be_bytes(*head.get(SQLITE_PAGES_AT..)?.first_chunk()?);
+    let page_bytes = match page_bytes {
+        1 => SQLITE_PAGE_BYTES_MAX,
+        page_bytes => u64::from(page_bytes),
+    };
+    (pages != 0).then(|| page_bytes * u64::from(pages))
+}
+
+/// The end-of-file address of a version 2 or 3 superblock.
+fn hdf5_bytes(head: &[u8]) -> Option<u64> {
+    let offset_bytes = usize::from(*head.get(HDF5_OFFSETS_AT)?);
+    if !matches!(head.get(HDF5_VERSION_AT)?, 2 | 3) || offset_bytes > size_of::<u64>() {
+        return None;
+    }
+    let at = HDF5_ADDRESSES_AT + 2 * offset_bytes;
+    let mut address = [0; size_of::<u64>()];
+    address[..offset_bytes].copy_from_slice(head.get(at..at + offset_bytes)?);
+    Some(u64::from_le_bytes(address))
+}
+
 /// What one slot's first bytes say.
 // A map holds few runs, so its SafeGraphs headers stay inline rather than boxed.
 #[allow(clippy::large_enum_variant)]
 pub enum Slot {
     SafeGraphs(Graph),
     UStore(UstoreOwnerBlock),
+    Table(Table),
     /// An all-zero first block.
     Free,
     Foreign,
@@ -127,6 +290,9 @@ pub fn classify(prefix: &[u8], room: u64) -> Slot {
     if let Some(block) = UstoreOwnerBlock::read(prefix) {
         return Slot::UStore(block);
     }
+    if let Some(table) = Table::read(prefix).filter(|table| table.bytes.is_none_or(|bytes| bytes <= room)) {
+        return Slot::Table(table);
+    }
     match prefix.iter().all(|&byte| byte == 0) {
         true => Slot::Free,
         false => Slot::Foreign,
@@ -134,7 +300,8 @@ pub fn classify(prefix: &[u8], room: u64) -> Slot {
 }
 
 /// Reads slot `slot` of `device` through `scratch` and classifies it: its first logical block
-/// alone, then up to the end of a SafeGraphs header only when that header says it is longer.
+/// alone, then up to the end of a SafeGraphs or safetensors header only when that header says it
+/// is longer.
 pub fn probe(device: &Device, slot: u32, scratch: &mut AlignedBuffer) -> Result<Slot, Error> {
     let offset = slot_extent(slot, 0).start;
     let room = device.bytes.saturating_sub(offset);
@@ -143,8 +310,10 @@ pub fn probe(device: &Device, slot: u32, scratch: &mut AlignedBuffer) -> Result<
         *scratch = AlignedBuffer::zeroed(device, block as u64)?;
     }
     let read = device.read_at(&mut scratch[..block], offset)?;
-    let header_bytes = GraphHeader::segment_start_of(&scratch[..read])
+    let head = &scratch[..read];
+    let header_bytes = GraphHeader::segment_start_of(head)
         .ok()
+        .or_else(|| safetensors_end(head))
         .filter(|&end| end > block && end as u64 <= room.min(SLOT_BYTES));
     let Some(header_bytes) = header_bytes else {
         return Ok(classify(&scratch[..read], room));
@@ -166,6 +335,8 @@ pub enum SpanOwner {
         block: UstoreOwnerBlock,
         held: Vec<u32>,
     },
+    /// A dataset exchange file, covering its declared length or else its one slot.
+    Table(Table),
     /// Consecutive foreign slots.
     Foreign,
 }
@@ -219,6 +390,15 @@ pub fn map(device: &Device) -> Result<SlotMap, Error> {
                     first_slot: slot,
                     slots: covered,
                     owner: SpanOwner::SafeGraphs(graph),
+                });
+            }
+            Slot::Table(table) => {
+                covered = u32::try_from(table.bytes.unwrap_or_default().div_ceil(SLOT_BYTES).max(1))
+                    .expect("a file that fits its drive covers fewer slots than the drive has");
+                spans.push(Span {
+                    first_slot: slot,
+                    slots: covered,
+                    owner: SpanOwner::Table(table),
                 });
             }
             Slot::Foreign => match spans.last_mut() {
@@ -339,5 +519,81 @@ pub mod tests {
         let mut stray = block_with(&[]);
         stray[BLOCK - 1] = 1;
         assert!(matches!(classify(&stray, SLOT_BYTES), Slot::Foreign));
+    }
+
+    fn table(head: &[u8], room: u64) -> Option<Table> {
+        match classify(&block_with(head), room) {
+            Slot::Table(table) => Some(table),
+            _ => None,
+        }
+    }
+
+    fn safetensors(header: &str) -> Vec<u8> {
+        let mut head = (header.len() as u64).to_le_bytes().to_vec();
+        head.extend_from_slice(header.as_bytes());
+        head
+    }
+
+    #[test]
+    fn recognizes_dataset_exchange_files_by_their_magic() {
+        let tensor = safetensors(r#"{"t":{"dtype":"U8","shape":[4],"data_offsets":[0,4]}}"#);
+        let heads: [(&[u8], TableFormat); 9] = [
+            (b"PAR1", TableFormat::Parquet),
+            (b"ARROW1\0\0", TableFormat::ArrowFile),
+            (b"ORC", TableFormat::Orc),
+            (b"\x93NUMPY", TableFormat::Numpy),
+            (b"SQLite format 3\0", TableFormat::Sqlite),
+            (b"\x89HDF\r\n\x1a\n", TableFormat::Hdf5),
+            (b"\x01\0\0\0\0\0\0\0DUCK", TableFormat::DuckDb),
+            (b"GGUF", TableFormat::Gguf),
+            (&tensor, TableFormat::Safetensors),
+        ];
+        for (head, format) in heads {
+            assert_eq!(table(head, SLOT_BYTES).map(|table| table.format), Some(format));
+        }
+        // Safetensors carries no magic, so a header naming no tensor is no table.
+        assert_eq!(table(&safetensors(r#"{"__metadata__":{}}"#), SLOT_BYTES), None);
+        assert_eq!(table(b"\x02\0\0\0\0\0\0\0[]", SLOT_BYTES), None);
+    }
+
+    #[test]
+    fn reads_the_lengths_heads_declare() {
+        let numpy = |descr: &str| {
+            let header = format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': (3, 4), }}\n");
+            let mut head = b"\x93NUMPY\x01\x00".to_vec();
+            head.extend_from_slice(&(header.len() as u16).to_le_bytes());
+            head.extend_from_slice(header.as_bytes());
+            (head, 10 + header.len() as u64)
+        };
+        let (head, header_end) = numpy("<f4");
+        assert_eq!(table(&head, SLOT_BYTES).unwrap().bytes, Some(header_end + 3 * 4 * 4));
+        assert_eq!(table(&numpy("|O").0, SLOT_BYTES).unwrap().bytes, None);
+
+        let header = r#"{"__metadata__":{"a":"b"},"x":{"dtype":"F32","shape":[6],"data_offsets":[8,32]},"y":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#;
+        let declared = table(&safetensors(header), SLOT_BYTES).unwrap().bytes;
+        assert_eq!(declared, Some(8 + header.len() as u64 + 32));
+
+        let sqlite = |page_bytes: u16, pages: u32| {
+            let mut head = b"SQLite format 3\0".to_vec();
+            head.extend_from_slice(&page_bytes.to_be_bytes());
+            head.resize(28, 0);
+            head.extend_from_slice(&pages.to_be_bytes());
+            head
+        };
+        assert_eq!(table(&sqlite(4096, 5), SLOT_BYTES).unwrap().bytes, Some(5 * 4096));
+        assert_eq!(table(&sqlite(1, 3), SLOT_BYTES).unwrap().bytes, Some(3 << 16));
+        assert_eq!(table(&sqlite(4096, 0), SLOT_BYTES).unwrap().bytes, None);
+        // A length past the drive's end is not trusted.
+        assert!(matches!(classify(&block_with(&sqlite(1, 3)), 3 << 15), Slot::Foreign));
+
+        let hdf5 = |version: u8| {
+            let mut head = b"\x89HDF\r\n\x1a\n".to_vec();
+            head.extend_from_slice(&[version, 8, 8, 0]);
+            head.resize(12 + 2 * 8, 0);
+            head.extend_from_slice(&123_456u64.to_le_bytes());
+            head
+        };
+        assert_eq!(table(&hdf5(2), SLOT_BYTES).unwrap().bytes, Some(123_456));
+        assert_eq!(table(&hdf5(0), SLOT_BYTES).unwrap().bytes, None);
     }
 }

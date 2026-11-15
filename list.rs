@@ -14,7 +14,7 @@ use std::path::Path;
 
 use crate::direct::{self, Access, Device};
 use crate::places::{rounded, size, Address, Location, ObjectAddress, Place, S3};
-use crate::slots::{self, slot_extent, Graph, Slot, SpanOwner, SLOT_BYTES};
+use crate::slots::{self, slot_extent, Graph, Slot, SpanOwner, Table, TableFormat, SLOT_BYTES};
 use crate::{Error, SLOT_SHIFT};
 
 pub const SAFEGRAPHS_SUFFIX: &str = ".safegraphs";
@@ -22,6 +22,20 @@ const USTORE_MANIFEST_SUFFIX: &str = ".ustore.json";
 const PARQUET_SUFFIX: &str = ".parquet";
 /// The folder a Parquet subset keeps its files in.
 const PARQUET_FOLDER: &str = "parquet";
+/// The suffixes naming a dataset exchange file, which a folder or bucket takes on trust, unread.
+pub const TABLE_SUFFIXES: [(&str, TableFormat); 11] = [
+    (".arrow", TableFormat::ArrowFile),
+    (".feather", TableFormat::ArrowFile),
+    (".orc", TableFormat::Orc),
+    (".npy", TableFormat::Numpy),
+    (".safetensors", TableFormat::Safetensors),
+    (".sqlite", TableFormat::Sqlite),
+    (".db", TableFormat::Sqlite),
+    (".h5", TableFormat::Hdf5),
+    (".hdf5", TableFormat::Hdf5),
+    (".duckdb", TableFormat::DuckDb),
+    (".gguf", TableFormat::Gguf),
+];
 /// The folder under the home folder that every survey includes.
 const DATA_FOLDER: &str = "Data";
 
@@ -108,6 +122,8 @@ pub enum Owner {
     Files {
         files: u64,
     },
+    /// A dataset exchange file, by its first page on a drive and by its suffix elsewhere.
+    Table(Table),
     /// Bytes no known format wrote, or a header or manifest that does not parse.
     Foreign,
     /// The header or manifest could not be read.
@@ -408,7 +424,8 @@ struct Group<'entries> {
 }
 
 /// Turns the files under one place into datasets: each SafeGraphs file is one, each folder with a
-/// UStore manifest or Parquet files is one, and every other file belongs to its top-level entry.
+/// UStore manifest or Parquet files is one, and every other file belongs to its top-level entry; a
+/// top-level file named like a dataset exchange file takes that file's format.
 fn group(entries: &[Entry], location: &Location, s3: Option<&S3>, place: u32, datasets: &mut Vec<Dataset>) {
     let read = |entry: &Entry, bytes| read_prefix(location, s3, entry, bytes);
     let (graphs, files): (Vec<&Entry>, Vec<&Entry>) = entries
@@ -453,7 +470,13 @@ fn group(entries: &[Entry], location: &Location, s3: Option<&S3>, place: u32, da
         let owner = match group.kind {
             Kind::Manifest(manifest) => read_manifest(read(manifest, manifest.bytes)),
             Kind::Parquet => Owner::Parquet { files: group.files },
-            Kind::Files => Owner::Files { files: group.files },
+            Kind::Files => {
+                let suffix = TABLE_SUFFIXES.iter().find(|(suffix, _)| group.name.ends_with(suffix));
+                match suffix {
+                    Some(&(_, format)) if group.files == 1 => Owner::Table(Table { format, bytes: None }),
+                    _ => Owner::Files { files: group.files },
+                }
+            }
         };
         datasets.push(Dataset {
             place,
@@ -532,6 +555,10 @@ fn survey_drive(path: &Path, place: u32, datasets: &mut Vec<Dataset>) -> Result<
                 let (database, medium) = (block.database, block.medium);
                 (extent, Owner::Directory { database, medium })
             }
+            SpanOwner::Table(table) => {
+                let end = table.bytes.map_or(extent.end, |bytes| extent.start + bytes);
+                (extent.start..end, Owner::Table(table))
+            }
             SpanOwner::Foreign => (extent, Owner::Foreign),
         };
         datasets.push(Dataset {
@@ -569,9 +596,10 @@ fn same_dataset(first: &Dataset, second: &Dataset) -> bool {
             first.header_digest == second.header_digest && first.file_bytes == second.file_bytes
         }
         (Owner::UStore { database: first, .. }, Owner::UStore { database: second, .. }) => first == second,
-        (Owner::Parquet { .. } | Owner::Files { .. }, Owner::Parquet { .. } | Owner::Files { .. }) => {
-            same_name(&first.name, &second.name)
-        }
+        (
+            Owner::Parquet { .. } | Owner::Files { .. } | Owner::Table(_),
+            Owner::Parquet { .. } | Owner::Files { .. } | Owner::Table(_),
+        ) => same_name(&first.name, &second.name),
         _ => false,
     }
 }
@@ -610,6 +638,7 @@ impl Owner {
             Owner::UStore { .. } | Owner::Directory { .. } => "UStore",
             Owner::Parquet { .. } => "Parquet",
             Owner::Files { .. } => "files",
+            Owner::Table(table) => table.format.name(),
             Owner::Foreign | Owner::Unreadable(_) => "foreign",
         }
     }
@@ -619,7 +648,7 @@ impl Owner {
         match self {
             Owner::SafeGraphs(_) => GRAPH_MARK,
             Owner::UStore { .. } | Owner::Directory { .. } => DATABASE_MARK,
-            Owner::Parquet { .. } | Owner::Files { .. } => FILES_MARK,
+            Owner::Parquet { .. } | Owner::Files { .. } | Owner::Table(_) => FILES_MARK,
             Owner::Foreign | Owner::Unreadable(_) => FOREIGN_MARK,
         }
     }
@@ -645,7 +674,7 @@ impl Owner {
                 let (count, noun) = words.split_once(' ').expect("a count and its noun");
                 [count.to_owned(), noun.to_owned()]
             }
-            Owner::Foreign => [String::new(), String::new()],
+            Owner::Table(_) | Owner::Foreign => [String::new(), String::new()],
             Owner::Unreadable(error) => [String::new(), error.to_string()],
         }
     }

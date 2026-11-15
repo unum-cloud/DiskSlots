@@ -1107,6 +1107,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 [[package]]
 name = "forkunion"
 version = "4.0.0-rc.1"
+source = "git+https://github.com/ashvardanian/ForkUnion#ce67be6511ce8cfc4b139b3e7266ec0e5edc372c"
 dependencies = [
  "cmake",
 ]
@@ -2345,6 +2346,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "safegraphs"
 version = "0.1.0"
+source = "git+https://github.com/safegraphs/SafeGraphs#0514e83fdbeaac290ba6e2a882ec52ad6aceefc2"
 dependencies = [
  "allocator-api2 0.4.0",
  "jsontape",
@@ -2557,6 +2559,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "stringzilla"
 version = "6.0.0-rc.1"
+source = "git+https://github.com/ashvardanian/StringZilla#ff22abca2e1f271f37bd8cb10174bc9dd37ed4e7"
 dependencies = [
  "cmake",
 ]

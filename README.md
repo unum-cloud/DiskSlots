@@ -44,7 +44,7 @@ On a Mac, with a folder named beside `~/Data` and a disk image attached as `/dev
 __Places__, on the left, lists `~/Data`, every NVMe namespace with no filesystem, every NVMe controller bound to `vfio-pci`, and whatever you name.
 A drive adds its model, LBA size, wear, temperature, queues, NUMA node and the processes holding it.
 __Datasets__, on the right, lists what the selected place holds: the format, what its header says, the size, and the other places holding a copy.
-A drive adds its slot bar, with `█` for SafeGraphs files, `▓` for UStore databases, `▒` for foreign slots and `·` for free ones.
+A drive adds its slot bar, with `█` for SafeGraphs files, `▓` for UStore databases, `░` for other dataset files, `▒` for foreign slots and `·` for free ones.
 
 Every action is one bare key.
 `c` opens __Copy__: pick a destination with `↑↓`, step through a drive's free runs with `←→`, `Enter` shows the plan, `y` starts it, and `Esc` stops it after the group in flight.
@@ -64,8 +64,8 @@ diskslots regroup /dev/nvme0n1
 
 - `list` prints every place, its datasets and, for a drive, its slot bar.
 - `copy` copies a file, a folder, a slot run, an S3 object or an S3 prefix to another place.
-- `free` frees the SafeGraphs file or UStore database starting at a slot.
-- `regroup` packs a drive's SafeGraphs files towards slot 0.
+- `free` frees the SafeGraphs file, other dataset file of declared length or UStore database starting at a slot.
+- `regroup` packs a drive's SafeGraphs files and other dataset files of declared length towards slot 0.
 
 S3 uses the AWS SDK's default credentials, profile and region, so `AWS_PROFILE` and `AWS_REGION` work as they do for the AWS CLI; SSO profiles are left out.
 `--endpoint https://storage.eu-north1.nebius.cloud` points it at an S3-compatible store instead.
@@ -92,13 +92,19 @@ DiskSlots reads the first page of each slot and checks it against each owner's o
 
 - a SafeGraphs file whose header parses and whose extent fits the drive covers as many slots as its length needs;
 - a UStore owner block, `USTORESL` with layout version 1, names the database holding that slot;
+- a dataset exchange file whose head declares its length, and whose length fits the drive, covers as many slots as that length needs;
+- a dataset exchange file whose length sits in a footer, or nowhere in its head, is named, one slot long, and never written;
 - an all-zero page is free;
 - anything else is foreign, one slot long, and never written.
 
+NumPy `.npy` declares its length through its shape and item size, safetensors through its header length and tensor offsets, SQLite through its page size and count, and HDF5 through the end-of-file address of a version 2 or 3 superblock.
+Parquet, Arrow, ORC, DuckDB and GGUF are recognized by their magic but declare no length up front, so a drive could never find where they end.
+A copy onto a drive refuses them, and they stay on filesystems and in S3, where folders and buckets name them by their suffixes.
+
 A copy lands only on slots that are all free, and writes the first page of every slot it covers last, so a copy that stops early leaves them free.
 Freeing zeroes the first page of every slot of the run, the one that makes it live first, then discards the rest of each slot.
-Regrouping moves each SafeGraphs file into a free run strictly before it, as a verified copy followed by a free, so no move overlaps its source.
-UStore databases and foreign slots stay where they are, and the files pack around them.
+Regrouping moves each SafeGraphs file and dataset file of declared length into a free run strictly before it, as a verified copy followed by a free, so no move overlaps its source.
+UStore databases, dataset files of undeclared length and foreign slots stay where they are, and the files pack around them.
 
 ## Integrity
 

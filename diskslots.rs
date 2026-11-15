@@ -25,6 +25,7 @@ mod regroup;
 mod slots;
 
 use places::{byte_count, parse_address, Address, ObjectAddress};
+use slots::TableFormat;
 
 /// Every dataset on a raw drive starts on a slot boundary, a multiple of `2^SLOT_SHIFT` bytes.
 pub const SLOT_SHIFT: u32 = 30;
@@ -74,8 +75,10 @@ pub enum Refusal {
     Overlap { address: Address },
     /// Process `pid` holds the drive open.
     Held { address: Address, pid: u32 },
-    /// A drive takes one SafeGraphs file or UStore stretch and nothing else.
+    /// A drive takes one SafeGraphs file, UStore stretch or file of declared length and nothing else.
     NotGraph { address: Address },
+    /// The format declares no length in its head, so a drive could not find where it ends.
+    Undeclared { address: Address, format: TableFormat },
     /// A UStore database names absolute offsets, so it copies only from and to its own base.
     StaysAtBase { address: Address },
     /// The destination has no room for `bytes`.
@@ -139,7 +142,12 @@ impl fmt::Display for Refusal {
             }
             Refusal::NotGraph { address } => write!(
                 formatter,
-                "{address} is not one SafeGraphs file or UStore database, and a drive takes nothing else"
+                "{address} is not one SafeGraphs file, UStore database or file declaring its length, and a drive takes nothing else"
+            ),
+            Refusal::Undeclared { address, format } => write!(
+                formatter,
+                "{address} holds {} with no length in its head, so it needs a filesystem",
+                format.name()
             ),
             Refusal::StaysAtBase { address } => write!(
                 formatter,

@@ -26,7 +26,7 @@ use stringzilla as sz;
 use crate::direct::{self, part_bytes, Access, AlignedBuffer, BufferPool, Device, PooledBuffer};
 use crate::list::{self, Entry};
 use crate::places::{s3_failed, size, Address, Location, ObjectAddress, Placement, S3};
-use crate::slots::{self, slot_at, slot_extent, Slot, SpanOwner, UstoreOwnerBlock, SLOT_BYTES};
+use crate::slots::{self, slot_at, slot_extent, Slot, SpanOwner, Table, UstoreOwnerBlock, SLOT_BYTES};
 use crate::{Error, Refusal, SLOT_SHIFT};
 
 /// The folder a copy into a bare bucket lands under, per the address rules.
@@ -164,7 +164,7 @@ impl fmt::Display for CopyPlan {
 /// What a source destined for a drive is, which decides where on the drive it may land.
 #[derive(Clone, Copy)]
 enum Payload {
-    /// A SafeGraphs file, which lands on any free run.
+    /// A SafeGraphs file or a file whose head declares its length, which lands on any free run.
     Graph,
     /// A UStore stretch, whose owner blocks name absolute offsets, so it lands only at slot `slot`.
     Pinned { slot: u32 },
@@ -296,7 +296,8 @@ fn sources(address: &Address, s3: Option<&S3>) -> Result<Sources, Error> {
     })
 }
 
-/// The SafeGraphs file or UStore stretch whose first slot sits at the address's base.
+/// The SafeGraphs file, UStore stretch or file of declared length whose first slot sits at the
+/// address's base.
 fn drive_source(path: &Path, address: &Address) -> Result<Sources, Error> {
     let device = Device::open(path, Access::Read)?;
     let slot = slot_at(address)?;
@@ -308,6 +309,11 @@ fn drive_source(path: &Path, address: &Address) -> Result<Sources, Error> {
         Some(span) => match &span.owner {
             SpanOwner::SafeGraphs(graph) => graph.file_bytes,
             SpanOwner::UStore { .. } => u64::from(span.slots) << SLOT_SHIFT,
+            SpanOwner::Table(Table { bytes: Some(bytes), .. }) => *bytes,
+            SpanOwner::Table(Table { format, .. }) => {
+                let (address, format) = (address.clone(), *format);
+                return Err(Error::Refused(Refusal::Undeclared { address, format }));
+            }
             SpanOwner::Foreign => return Err(refused(|address| Refusal::Foreign { address }, address)),
         },
         None => return Err(refused(|address| Refusal::Empty { address }, address)),
@@ -434,7 +440,13 @@ fn payload(item: &Item, destination: &Device, s3: Option<&S3>) -> Result<Payload
             .map(|slot| Payload::Pinned { slot })
             .ok_or_else(|| refused(|address| Refusal::StaysAtBase { address }, &address)),
         (None, _) if head.starts_with(&safegraphs::MAGIC) => Ok(Payload::Graph),
-        (None, _) => Err(refused(|address| Refusal::NotGraph { address }, &address)),
+        (None, _) => match Table::read(head) {
+            Some(Table { bytes: Some(_), .. }) => Ok(Payload::Graph),
+            Some(Table { format, .. }) => Err(Error::Refused(Refusal::Undeclared { address, format })),
+            // A safetensors header longer than one block is parsed with the whole first part.
+            None if slots::safetensors_end(head).is_some() => Ok(Payload::Graph),
+            None => Err(refused(|address| Refusal::NotGraph { address }, &address)),
+        },
     }
 }
 
@@ -828,10 +840,11 @@ fn first_blocks_of(transfer: &Transfer, index: u16) -> impl Iterator<Item = (usi
 }
 
 /// Refuses part 0 bound for a drive unless it opens what planning took it for: a SafeGraphs file
-/// of the transfer's length, or a UStore stretch, which planning pinned to its slot.
+/// or a file declaring the transfer's length, or a UStore stretch, which planning pinned to its slot.
 fn check_landing(lane: &Lane, transfer: &Transfer) -> Result<(), Error> {
     match slots::classify(lane_bytes(lane), transfer.bytes) {
         Slot::SafeGraphs(graph) if graph.file_bytes == transfer.bytes => Ok(()),
+        Slot::Table(Table { bytes: Some(bytes), .. }) if bytes == transfer.bytes => Ok(()),
         Slot::UStore(_) => Ok(()),
         _ => Err(Error::Refused(Refusal::NotGraph {
             address: transfer.source.address(transfer.bytes),

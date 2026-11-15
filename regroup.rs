@@ -3,7 +3,8 @@
 //!
 //! Each move is a verified copy into a free run that ends by the source's first slot, then a free
 //! of the source, so no move overlaps what it copies and a crash leaves an extra copy, never a
-//! missing one. UStore databases and foreign slots stay where they are, and runs pack around them.
+//! missing one. UStore databases, files of undeclared length and foreign slots stay where they are,
+//! and runs pack around them.
 
 use std::fmt;
 use std::ops::{ControlFlow, Range};
@@ -14,7 +15,7 @@ use crate::direct::{Access, Device};
 use crate::free::{refuse_held, FreePlan};
 use crate::list::plural;
 use crate::places::Address;
-use crate::slots::{self, first_free_run, slot_extent, Span, SpanOwner};
+use crate::slots::{self, first_free_run, slot_extent, Span, SpanOwner, Table};
 use crate::Error;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,7 +66,7 @@ pub fn plan(spans: &[(Range<u32>, bool)]) -> (Vec<Move>, Vec<Range<u32>>) {
 }
 
 impl RegroupPlan {
-    /// Maps `drive` and plans its moves; only SafeGraphs files move.
+    /// Maps `drive` and plans its moves; only SafeGraphs files and files of declared length move.
     pub fn new(drive: &Path) -> Result<RegroupPlan, Error> {
         refuse_held(drive, &Address::path(drive))?;
         let map = slots::map(&Device::open(drive, Access::Read)?)?;
@@ -75,7 +76,10 @@ impl RegroupPlan {
             .map(|span| {
                 (
                     span.first_slot..span.end(),
-                    matches!(span.owner, SpanOwner::SafeGraphs(_)),
+                    matches!(
+                        span.owner,
+                        SpanOwner::SafeGraphs(_) | SpanOwner::Table(Table { bytes: Some(_), .. })
+                    ),
                 )
             })
             .collect();
@@ -83,6 +87,7 @@ impl RegroupPlan {
         let moved = |span: &&Span| moves.iter().any(|step| step.from_slot == span.first_slot);
         let bytes = map.spans.iter().filter(moved).map(|span| match &span.owner {
             SpanOwner::SafeGraphs(graph) => graph.file_bytes,
+            SpanOwner::Table(Table { bytes: Some(bytes), .. }) => *bytes,
             _ => 0,
         });
         Ok(RegroupPlan {

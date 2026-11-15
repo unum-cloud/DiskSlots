@@ -2,7 +2,8 @@
 //!
 //! Freeing zeroes the first logical block of every slot the run covers, the run's first slot
 //! first, so the run stops being live before anything else changes, and then discards the rest of
-//! each slot. Only SafeGraphs files and UStore databases are freed; foreign slots are never touched.
+//! each slot. Only SafeGraphs files, files of declared length and UStore databases are freed; foreign
+//! slots are never touched.
 
 use std::fmt;
 use std::ops::ControlFlow;
@@ -12,7 +13,7 @@ use crate::copy::Progress;
 use crate::direct::{Access, AlignedBuffer, Device};
 use crate::list;
 use crate::places::{Address, Location};
-use crate::slots::{self, slot_at, slot_extent, SpanOwner, SLOT_BYTES};
+use crate::slots::{self, slot_at, slot_extent, SpanOwner, Table, SLOT_BYTES};
 use crate::{Error, Refusal};
 
 /// The slots one free zeroes, the one that makes the run live first.
@@ -34,7 +35,7 @@ pub fn refuse_held(drive: &Path, address: &Address) -> Result<(), Error> {
 }
 
 impl FreePlan {
-    /// The SafeGraphs file or UStore data directory starting at `run`, such as
+    /// The SafeGraphs file, file of declared length or UStore data directory starting at `run`, such as
     /// `/dev/nvme0n1@96GiB`.
     pub fn new(run: &Address) -> Result<FreePlan, Error> {
         let Location::Path(drive) = &run.location else {
@@ -46,9 +47,11 @@ impl FreePlan {
         let refused = |refusal: fn(Address) -> Refusal| Err(Error::Refused(refusal(run.clone())));
         let held = match map.covering(first) {
             Some(span) if span.first_slot == first => match &span.owner {
-                SpanOwner::SafeGraphs(_) => (first..span.end()).collect(),
+                SpanOwner::SafeGraphs(_) | SpanOwner::Table(Table { bytes: Some(_), .. }) => {
+                    (first..span.end()).collect()
+                }
                 SpanOwner::UStore { held, .. } => held.clone(),
-                SpanOwner::Foreign => return refused(|address| Refusal::Foreign { address }),
+                SpanOwner::Table(_) | SpanOwner::Foreign => return refused(|address| Refusal::Foreign { address }),
             },
             Some(_) => return refused(|address| Refusal::Foreign { address }),
             None => return refused(|address| Refusal::Free { address }),

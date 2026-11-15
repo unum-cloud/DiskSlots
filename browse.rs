@@ -27,7 +27,7 @@ use crate::free::FreePlan;
 use crate::list::{self, dataset_bytes, index, plural, slot_bar, slot_range, Medium, Owner, Survey, SAFEGRAPHS_SUFFIX};
 use crate::places::{size, Address, Place, S3};
 use crate::regroup::RegroupPlan;
-use crate::slots::{slot_extent, SLOT_BYTES};
+use crate::slots::{slot_extent, Table, SLOT_BYTES};
 use crate::Error;
 
 /// A bordered block's left and right edges, or its top and bottom ones.
@@ -305,7 +305,10 @@ impl Browser<'_> {
                     is_drive(&self.survey, found.place)
                         && matches!(
                             found.owner,
-                            Owner::SafeGraphs(_) | Owner::UStore { .. } | Owner::Directory { .. }
+                            Owner::SafeGraphs(_)
+                                | Owner::Table(Table { bytes: Some(_), .. })
+                                | Owner::UStore { .. }
+                                | Owner::Directory { .. }
                         )
                 });
                 let Some(dataset) = freeable else {
@@ -647,14 +650,15 @@ fn is_drive(survey: &Survey, place: u32) -> bool {
 }
 
 /// Whether `place` may take a copy of `dataset`: a folder, a bucket, or a drive for a SafeGraphs
-/// file, other than the dataset's own place.
+/// or dataset exchange file, which the plan refuses when its head declares no length, other than
+/// the dataset's own place.
 fn takes_copy(survey: &Survey, dataset: u32, place: u32) -> bool {
     let found = survey.dataset(dataset);
     place != found.place
         && match (&survey.places[place as usize], &survey.media[place as usize]) {
             (_, Medium::Unreachable(_)) => false,
             (Place::Folder(_) | Place::Bucket(_), _) => true,
-            (Place::Drive(_), _) => matches!(found.owner, Owner::SafeGraphs(_)),
+            (Place::Drive(_), _) => matches!(found.owner, Owner::SafeGraphs(_) | Owner::Table(_)),
             (Place::File(_) | Place::Bound(_), _) => false,
         }
 }
@@ -709,7 +713,14 @@ fn copy_destination(survey: &Survey, dataset: u32, destination: u32, run: u32) -
     if !found.name.is_empty() || !is_drive(survey, found.place) {
         return address;
     }
-    let name = format!("{}{SAFEGRAPHS_SUFFIX}", survey.dataset_name(dataset));
+    let suffix = match &found.owner {
+        Owner::Table(table) => list::TABLE_SUFFIXES
+            .iter()
+            .find(|(_, format)| *format == table.format)
+            .map_or("", |&(suffix, _)| suffix),
+        _ => SAFEGRAPHS_SUFFIX,
+    };
+    let name = format!("{}{suffix}", survey.dataset_name(dataset));
     Address {
         location: address.location.join(&name),
         ..address
